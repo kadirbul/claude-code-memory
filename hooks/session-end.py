@@ -94,6 +94,7 @@ def extract_conversation_context(transcript_path: Path) -> tuple[str, int]:
 def main() -> None:
     # Read hook input from stdin
     # Claude Code on Windows may pass paths with unescaped backslashes
+    raw_input = ""
     try:
         raw_input = sys.stdin.read()
         try:
@@ -102,17 +103,43 @@ def main() -> None:
             fixed_input = re.sub(r'(?<!\\)\\(?!["\\])', r'\\\\', raw_input)
             hook_input = json.loads(fixed_input)
     except (json.JSONDecodeError, ValueError, EOFError) as e:
-        logging.error("Failed to parse stdin: %s", e)
+        logging.error("Failed to parse stdin: %s | raw=%r", e, raw_input[:500])
         return
 
-    session_id = hook_input.get("session_id", "unknown")
+    session_id = hook_input.get("session_id", "")
     source = hook_input.get("source", "unknown")
+    event_name = hook_input.get("hook_event_name", "unknown")
     transcript_path_str = hook_input.get("transcript_path", "")
+    cwd = hook_input.get("cwd", "")
 
-    logging.info("SessionEnd fired: session=%s source=%s", session_id, source)
+    logging.info(
+        "Hook fired: event=%s session=%s source=%s cwd=%s xpath=%s",
+        event_name, session_id or "<empty>", source,
+        cwd or "<empty>", transcript_path_str or "<empty>",
+    )
+
+    # Fallback: if transcript_path is missing but we have a session_id and cwd,
+    # reconstruct the path from the standard CC layout:
+    #   ~/.claude/projects/<project-key>/<session_id>.jsonl
+    # The project-key is the absolute cwd with separators replaced by '-' and
+    # leading drive ':' stripped (e.g. 'C--claude-code-brain-os').
+    if not transcript_path_str and session_id and cwd:
+        try:
+            home = Path.home()
+            key = re.sub(r'[\\/:]+', '-', cwd).strip('-')
+            candidate = home / ".claude" / "projects" / key / f"{session_id}.jsonl"
+            if candidate.exists():
+                transcript_path_str = str(candidate)
+                logging.info("Recovered transcript_path via cwd+session_id: %s", candidate)
+        except Exception as e:
+            logging.warning("Transcript recovery failed: %s", e)
 
     if not transcript_path_str or not isinstance(transcript_path_str, str):
-        logging.info("SKIP: no transcript path")
+        # Log full payload (truncated) so we can see what CC actually sent.
+        logging.info(
+            "SKIP: no transcript path. payload_keys=%s raw=%r",
+            list(hook_input.keys()), raw_input[:500],
+        )
         return
 
     transcript_path = Path(transcript_path_str)
@@ -143,8 +170,17 @@ def main() -> None:
     # Spawn flush.py as a background process
     flush_script = SCRIPTS_DIR / "flush.py"
 
+    # Use full path to uv.exe — when hooks fire from /usr/bin/bash on Windows,
+    # "uv" alone isn't on PATH (causes WinError 2 / "command not found").
+    import shutil as _shutil
+    uv_exe = (
+        _shutil.which("uv")
+        or _shutil.which("uv.exe")
+        or str(Path.home() / ".local" / "bin" / "uv.exe")
+    )
+
     cmd = [
-        "uv",
+        uv_exe,
         "run",
         "--directory",
         str(ROOT),

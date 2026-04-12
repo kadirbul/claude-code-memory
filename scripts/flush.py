@@ -53,9 +53,21 @@ def save_flush_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
 
 
-def append_to_daily_log(content: str, section: str = "Session") -> None:
-    """Append content to today's daily log."""
-    today = datetime.now(timezone.utc).astimezone()
+def append_to_daily_log(content: str, section: str = "Session", target_date: str | None = None) -> None:
+    """Append content to a daily log.
+
+    target_date — optional 'YYYY-MM-DD' to write into a specific day's log
+    instead of today's. Used by backfill so historical sessions land in
+    the correct daily file.
+    """
+    if target_date:
+        try:
+            parsed = datetime.strptime(target_date, "%Y-%m-%d")
+            today = parsed.astimezone()
+        except ValueError:
+            today = datetime.now(timezone.utc).astimezone()
+    else:
+        today = datetime.now(timezone.utc).astimezone()
     log_path = DAILY_DIR / f"{today.strftime('%Y-%m-%d')}.md"
 
     if not log_path.exists():
@@ -174,11 +186,22 @@ def maybe_trigger_compilation() -> None:
 
     logging.info("End-of-day compilation triggered (after %d:00)", COMPILE_AFTER_HOUR)
 
-    cmd = ["uv", "run", "--directory", str(ROOT), "python", str(compile_script)]
+    # Resolve uv.exe with full path — Windows subprocess.Popen does not
+    # search PATH the same way the shell does, so unqualified `uv` fails
+    # with WinError 2 even when uv is on PATH for an interactive shell.
+    import shutil as _shutil
+    uv_exe = (
+        _shutil.which("uv")
+        or _shutil.which("uv.exe")
+        or str(Path.home() / ".local" / "bin" / "uv.exe")
+    )
+    cmd = [uv_exe, "run", "--directory", str(ROOT), "python", str(compile_script)]
 
     kwargs: dict = {}
     if sys.platform == "win32":
-        kwargs["creationflags"] = _sp.CREATE_NEW_PROCESS_GROUP | _sp.DETACHED_PROCESS
+        # Use CREATE_NO_WINDOW — DO NOT use DETACHED_PROCESS as it breaks
+        # the Agent SDK's subprocess I/O (compile.py calls Claude Agent SDK).
+        kwargs["creationflags"] = _sp.CREATE_NO_WINDOW
     else:
         kwargs["start_new_session"] = True
 
@@ -190,12 +213,16 @@ def maybe_trigger_compilation() -> None:
 
 
 def main():
+    # Usage: flush.py <context_file.md> <session_id> [target_date YYYY-MM-DD]
+    # target_date is optional; backfill.py uses it to route historical
+    # transcripts to the correct daily log.
     if len(sys.argv) < 3:
-        logging.error("Usage: %s <context_file.md> <session_id>", sys.argv[0])
+        logging.error("Usage: %s <context_file.md> <session_id> [target_date]", sys.argv[0])
         sys.exit(1)
 
     context_file = Path(sys.argv[1])
     session_id = sys.argv[2]
+    target_date = sys.argv[3] if len(sys.argv) > 3 else None
 
     logging.info("flush.py started for session %s, context: %s", session_id, context_file)
 
@@ -203,13 +230,21 @@ def main():
         logging.error("Context file not found: %s", context_file)
         return
 
-    # Deduplication: skip if same session was flushed within 60 seconds
+    # Deduplication: skip if same session was flushed within the dedup window.
+    # Window must be long enough that the Stop hook (which fires after every
+    # assistant turn) doesn't spam the LLM, but short enough that long sessions
+    # still get periodic snapshots. 30 min strikes the balance — combined with
+    # MAX_TURNS=30 in session-end.py, each flush captures the most recent
+    # ~30 turns, so a multi-hour session naturally gets several snapshots.
+    DEDUP_WINDOW_S = 1800  # 30 minutes
     state = load_flush_state()
-    if (
-        state.get("session_id") == session_id
-        and time.time() - state.get("timestamp", 0) < 60
-    ):
-        logging.info("Skipping duplicate flush for session %s", session_id)
+    sessions = state.get("sessions", {}) if isinstance(state.get("sessions"), dict) else {}
+    last_ts = sessions.get(session_id, 0)
+    if time.time() - last_ts < DEDUP_WINDOW_S:
+        logging.info(
+            "Skipping duplicate flush for session %s (last flushed %ds ago)",
+            session_id, int(time.time() - last_ts),
+        )
         context_file.unlink(missing_ok=True)
         return
 
@@ -229,17 +264,23 @@ def main():
     if "FLUSH_OK" in response:
         logging.info("Result: FLUSH_OK")
         append_to_daily_log(
-            "FLUSH_OK - Nothing worth saving from this session", "Memory Flush"
+            "FLUSH_OK - Nothing worth saving from this session", "Memory Flush",
+            target_date=target_date,
         )
     elif "FLUSH_ERROR" in response:
         logging.error("Result: %s", response)
-        append_to_daily_log(response, "Memory Flush")
+        append_to_daily_log(response, "Memory Flush", target_date=target_date)
     else:
         logging.info("Result: saved to daily log (%d chars)", len(response))
-        append_to_daily_log(response, "Session")
+        append_to_daily_log(response, "Session", target_date=target_date)
 
-    # Update dedup state
-    save_flush_state({"session_id": session_id, "timestamp": time.time()})
+    # Update dedup state — keep a per-session timestamp map so different
+    # concurrent sessions don't shadow each other.
+    sessions[session_id] = time.time()
+    # Cap state size: keep only the 50 most recent sessions
+    if len(sessions) > 50:
+        sessions = dict(sorted(sessions.items(), key=lambda kv: kv[1], reverse=True)[:50])
+    save_flush_state({"sessions": sessions, "last_session_id": session_id})
 
     # Clean up context file
     context_file.unlink(missing_ok=True)
