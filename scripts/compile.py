@@ -49,18 +49,23 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
     schema = AGENTS_FILE.read_text(encoding="utf-8")
     wiki_index = read_wiki_index()
 
-    # Read existing articles for context
-    existing_articles_context = ""
-    existing = {}
-    for article_path in list_wiki_articles():
-        rel = article_path.relative_to(KNOWLEDGE_DIR)
-        existing[str(rel)] = article_path.read_text(encoding="utf-8")
-
-    if existing:
-        parts = []
-        for rel_path, content in existing.items():
-            parts.append(f"### {rel_path}\n```markdown\n{content}\n```")
-        existing_articles_context = "\n\n".join(parts)
+    # List existing articles by PATH ONLY - never inline their contents.
+    #
+    # This used to read every article's full text into the prompt. That made the
+    # prompt grow linearly with the knowledge base (1.58 MB across 324 articles by
+    # 2026-07-26) and, because it is re-sent on all 30 turns, drove compile cost to
+    # ~$5 per daily log REGARDLESS of the log's size - a 118-byte log on 2026-07-16
+    # cost $4.82. Cost was also quadratic overall: each new article made every
+    # future compile more expensive.
+    #
+    # The agent has Read/Grep/Glob, so it opens the handful of articles a given log
+    # actually touches instead of receiving all of them.
+    article_paths = [str(p.relative_to(KNOWLEDGE_DIR)) for p in list_wiki_articles()]
+    existing_articles_context = (
+        "\n".join(f"- {rel}" for rel in article_paths)
+        if article_paths
+        else "(No existing articles yet)"
+    )
 
     timestamp = now_iso()
 
@@ -75,9 +80,13 @@ and extract knowledge into structured wiki articles.
 
 {wiki_index}
 
-## Existing Wiki Articles
+## Existing Wiki Articles (paths only, relative to `knowledge/`)
 
-{existing_articles_context if existing_articles_context else "(No existing articles yet)"}
+{existing_articles_context}
+
+Their contents are deliberately NOT included here. Before you update or link to any
+article, open it with the Read tool. Use Grep to find which articles already mention
+a concept. Only read the articles this daily log actually touches - do not read them all.
 
 ## Daily Log to Compile
 
@@ -133,6 +142,17 @@ Read the daily log above and compile it into wiki articles following the schema 
             prompt=prompt,
             options=ClaudeAgentOptions(
                 cwd=str(ROOT_DIR),
+                # Pin the model explicitly. This was previously unset, so it inherited the
+                # SDK default (Opus) - the most expensive tier - for what is structured
+                # authoring, not frontier reasoning. Sonnet 5 is ~2.5x cheaper at current
+                # pricing with comparable quality on this kind of agentic file work.
+                # Pinning also stops a future SDK default from silently moving our costs.
+                model="claude-sonnet-5",
+                # Hard per-file spend ceiling. A normal daily log compiles for well under
+                # $1; this is ~6x headroom, so it never trips in normal operation but caps
+                # a regression instead of discovering it in the morning. On 2026-07-26 a
+                # single unbounded run cost $45.31 (see the prompt-size comment above).
+                max_budget_usd=2.00,
                 system_prompt={"type": "preset", "preset": "claude_code"},
                 allowed_tools=["Read", "Write", "Edit", "Glob", "Grep"],
                 permission_mode="acceptEdits",
