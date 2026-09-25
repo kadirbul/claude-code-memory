@@ -69,6 +69,20 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
 
     timestamp = now_iso()
 
+    # The task rules below are ordered SEARCH-FIRST, not create-first, and say so in
+    # bold. They used to read "2. Create concept articles ... 4. Update existing
+    # articles IF ...", which made creating the default and updating a conditional
+    # afterthought. Combined with the (correct, cost-driven) instruction above not to
+    # read every article, the agent had no obligation to look before writing, so a
+    # recurring topic got a fresh file under a reshuffled title instead of an update.
+    # Measured 2026-09-25 across 603 articles: 101 pairs sharing >=60% of their title
+    # words and 8 exact word-for-word permutations, e.g.
+    # `ssrf-unvalidated-urlopen-scheme` / `urlopen-ssrf-unvalidated-scheme`. INI-018
+    # alone had six articles describing one programme. That is a recall-quality
+    # problem, not a disk problem - a lookup returns six articles saying the same
+    # thing and neither reader nor agent can tell which is current. See
+    # WI-bugfix-3cdd9f. Collapsing the ALREADY-duplicated pairs is deliberately NOT
+    # done here; it belongs at retrieval time (INI-018 U8). This stops the growth.
     prompt = f"""You are a knowledge compiler. Your job is to read a daily conversation log
 and extract knowledge into structured wiki articles.
 
@@ -101,15 +115,27 @@ Read the daily log above and compile it into wiki articles following the schema 
 ### Rules:
 
 1. **Extract key concepts** - Identify 3-7 distinct concepts worth their own article
-2. **Create concept articles** in `knowledge/concepts/` - One .md file per concept
+
+2. **For EACH concept, SEARCH BEFORE YOU WRITE.** Grep `knowledge/concepts/` for the
+   concept's distinctive words, and scan the article-path list above. Search for
+   REORDERED and SYNONYMOUS forms of the title, not just the exact slug you have in
+   mind - the same topic has repeatedly been filed twice under permuted names, e.g.
+   `ssrf-unvalidated-urlopen-scheme` alongside `urlopen-ssrf-unvalidated-scheme`.
+   - **An article on this concept already exists -> UPDATE IT IN PLACE.** Read it, merge
+     the new information into its existing sections, and add this daily log to
+     `sources:`. Do NOT write a second article on a topic that already has one, and
+     never create a file whose title is a reordering or near-synonym of an existing one.
+   - **Nothing matches -> create a new article** in `knowledge/concepts/`, one .md file
+     per concept.
+
+3. **Article format** - applies whether you created or updated the article
    - Use the exact article format from AGENTS.md (YAML frontmatter + sections)
    - Include `sources:` in frontmatter pointing to the daily log file
    - Use `[[concepts/slug]]` wikilinks to link to related concepts
    - Write in encyclopedia style - neutral, comprehensive
-3. **Create connection articles** in `knowledge/connections/` if this log reveals non-obvious
+
+4. **Create connection articles** in `knowledge/connections/` if this log reveals non-obvious
    relationships between 2+ existing concepts
-4. **Update existing articles** if this log adds new information to concepts already in the wiki
-   - Read the existing article, add the new information, add the source to frontmatter
 5. **Update knowledge/index.md** - Add new entries to the table
    - Each entry: `| [[path/slug]] | One-line summary | source-file | {timestamp[:10]} |`
 6. **Append to knowledge/log.md** - Add a timestamped entry:
