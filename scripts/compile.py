@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import os
 import sys
 from pathlib import Path
 
@@ -29,6 +30,22 @@ from utils import (
     read_wiki_index,
     save_state,
 )
+
+# Mark every nested Claude session this script starts as machine-invoked, BEFORE the
+# SDK is imported or spawned. hooks/session-end.py and hooks/pre-compact.py both bail
+# out when they see this, exactly as flush.py:16 and backfill.py:251 already do.
+#
+# WHY (found in review of d921e51): compile.py spawns an Agent-SDK session whose cwd is
+# this project, so .claude/settings.json applies to it and its SessionEnd hook fires.
+# Repairing those hook paths made that hook WORK, which re-armed a loop compile.py had
+# never needed a guard for: compile -> session-end.py -> flush.py -> flush summarises
+# the COMPILER'S OWN transcript into today's daily log -> maybe_trigger_compilation()
+# spawns compile.py again. Observed live at 08:32:41 on 2026-09-26, during this very
+# script's run (scripts/flush.log, session 4d358782). It stopped there only because the
+# hour was before COMPILE_AFTER_HOUR; at the 22:00 nightly slot it would not have.
+# Besides the wasted work, it feeds the compiler's self-description into the wiki as
+# articles - manufacturing the duplication this changeset exists to reduce.
+os.environ["CLAUDE_INVOKED_BY"] = "memory_compile"
 
 # ── Paths for the LLM to use ──────────────────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -96,7 +113,7 @@ def state_entry(raw: bytes, cost: float) -> dict:
     }
 
 
-async def compile_daily_log(log_path: Path, state: dict) -> float:
+async def compile_daily_log(log_path: Path, state: dict, force: bool = False) -> float:
     """Compile a single daily log into knowledge articles.
 
     Returns the API cost of the compilation.
@@ -110,12 +127,27 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
     )
 
     raw_bytes = log_path.read_bytes()
-    prev_entry = (state.get("ingested") or {}).get(log_path.name) or {}
+    # `--all` and `--file` are the documented recovery levers ("Force recompile all
+    # logs"), so they must mean the WHOLE log, not the tail. Discarding prev_entry is
+    # what makes select_log_content fall back to a full compile; without this, a
+    # rebuild after the wiki is damaged would silently send only appended text and
+    # report success (found in review of d921e51).
+    prev_entry = {} if force else ((state.get("ingested") or {}).get(log_path.name) or {})
     log_content, is_increment = select_log_content(raw_bytes, prev_entry)
+    # The note must also OVERRIDE rule 1's "3-7 concepts" floor. An increment can be a
+    # few hundred characters, and a floor applied to it forces the agent to pad one
+    # throwaway remark into three articles - each a reworded facet of something the
+    # earlier full compile already wrote. That would manufacture exactly the
+    # near-duplicates this change exists to prevent (found in review of d921e51).
     increment_note = (
         "  **INCREMENT** - this day was already compiled. What follows is ONLY the text"
         " appended since. Everything before it ALREADY HAS ARTICLES: update those, never"
-        " re-create them under a new title."
+        " re-create them under a new title. **This OVERRIDES the 3-7 concept count in"
+        " rule 1: for an increment the right number is 0-3, and ZERO IS A CORRECT AND"
+        " COMMON ANSWER.** A short tail usually warrants updating one existing article"
+        " and nothing else. Do not invent articles to reach a quota; if the appended"
+        " text adds no new concept, update what exists, note that in knowledge/log.md,"
+        " and stop."
         if is_increment
         else ""
     )
@@ -242,6 +274,7 @@ Read the daily log above and compile it into wiki articles following the schema 
 """
 
     cost = 0.0
+    incomplete = False
 
     try:
         async for message in query(
@@ -287,17 +320,62 @@ Read the daily log above and compile it into wiki articles following the schema 
             elif isinstance(message, ResultMessage):
                 cost = message.total_cost_usd or 0.0
                 print(f"  Cost: ${cost:.4f}")
+                # A run can END BADLY WITHOUT RAISING: hitting max_turns yields a
+                # ResultMessage with subtype "error_max_turns" and exit code 0, so no
+                # exception reaches the handler below. Recording that as compiled used
+                # to be self-healing - state stored a re-read hash that no longer
+                # matched, so the next run redid the whole log and picked up the
+                # concepts the agent never got to. With incremental compiling the
+                # stored prefix matches exactly, the next run sends only the tail, and
+                # the unprocessed middle of the log is never compiled by anyone.
+                # So: an incomplete result must NOT be recorded as a complete compile.
+                if message.is_error or message.subtype != "success":
+                    print(f"  Incomplete result ({message.subtype}) —"
+                          " leaving this log pending so it is retried in full")
+                    incomplete = True
     except Exception as e:
+        # The ResultMessage often arrives BEFORE the failure, so `cost` is usually
+        # already set: returning 0.0 here threw away a real, already-incurred figure
+        # and total_cost silently under-reported (WI-bugfix-1fac6f: $3.94-equivalent
+        # unaccounted on 2026-09-25). Bank what was spent; still do NOT write an
+        # "ingested" record, so the log stays pending and is retried in full.
         print(f"  Error: {e}")
-        return 0.0
+        state["total_cost"] = state.get("total_cost", 0.0) + cost
+        save_state(state)
+        return cost
+
+    # The capacity was consumed either way, so always bank it - an incomplete run that
+    # reported a cost must still show up in the ledger (WI-bugfix-1fac6f).
+    state["total_cost"] = state.get("total_cost", 0.0) + cost
+
+    if incomplete:
+        # Deliberately do NOT write an "ingested" record: leaving the log pending means
+        # the next run recompiles it IN FULL, which is the recovery path. Writing one
+        # here would tell select_log_content() the whole file was handled and the
+        # unprocessed part would be skipped permanently.
+        save_state(state)
+        return cost
 
     # Update state
     rel_path = log_path.name
     state.setdefault("ingested", {})[rel_path] = state_entry(raw_bytes, cost)
-    state["total_cost"] = state.get("total_cost", 0.0) + cost
     save_state(state)
 
     return cost
+
+
+def report_duplicates() -> None:
+    """Print the near-duplicate trend line.
+
+    Called on EVERY exit path, including "nothing to compile" and --dry-run. The point
+    of the number is to be a trend the nightly log carries, and the common steady-state
+    night compiles nothing at all - so printing it only after real work left gaps in
+    scheduled_compile.log exactly where a flat baseline is most informative.
+    """
+    dupes = near_duplicate_pairs()
+    print(f"Near-duplicate article pairs: {len(dupes)}")
+    for name_a, name_b, overlap in dupes[:5]:
+        print(f"  {overlap:.2f}  {name_a}  <->  {name_b}")
 
 
 def main():
@@ -335,6 +413,7 @@ def main():
 
     if not to_compile:
         print("Nothing to compile - all daily logs are up to date.")
+        report_duplicates()
         return
 
     print(f"{'[DRY RUN] ' if args.dry_run else ''}Files to compile ({len(to_compile)}):")
@@ -342,13 +421,16 @@ def main():
         print(f"  - {f.name}")
 
     if args.dry_run:
+        report_duplicates()
         return
 
     # Compile each file sequentially
     total_cost = 0.0
     for i, log_path in enumerate(to_compile, 1):
         print(f"\n[{i}/{len(to_compile)}] Compiling {log_path.name}...")
-        cost = asyncio.run(compile_daily_log(log_path, state))
+        cost = asyncio.run(
+            compile_daily_log(log_path, state, force=bool(args.all or args.file))
+        )
         total_cost += cost
         print(f"  Done.")
 
@@ -360,10 +442,7 @@ def main():
     # counts files by hand. Printing the count on every run makes it a trend the
     # nightly log carries, so a regression shows up as a rising number, and a fix
     # has something to be measured against (WI-bugfix-3cdd9f).
-    dupes = near_duplicate_pairs()
-    print(f"Near-duplicate article pairs: {len(dupes)}")
-    for name_a, name_b, overlap in dupes[:5]:
-        print(f"  {overlap:.2f}  {name_a}  <->  {name_b}")
+    report_duplicates()
 
 
 if __name__ == "__main__":

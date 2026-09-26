@@ -12,6 +12,7 @@ from config import (
     INDEX_FILE,
     KNOWLEDGE_DIR,
     LOG_FILE,
+    PROJECTS_DIR,
     QA_DIR,
     STATE_FILE,
 )
@@ -87,9 +88,16 @@ def read_all_wiki_content() -> str:
 
 
 def list_wiki_articles() -> list[Path]:
-    """List all wiki article files."""
+    """List all wiki article files.
+
+    PROJECTS_DIR was missing from this list until 2026-09-26. Everything that walks the
+    wiki goes through here - the "existing articles" list the compiler is told to search
+    before writing, and near_duplicate_pairs() - so an omitted directory was invisible to
+    BOTH: a log revisiting a projects/ topic got a fresh concepts/ article instead of an
+    update, which is the exact duplication mechanism the search rule exists to stop.
+    """
     articles = []
-    for subdir in [CONCEPTS_DIR, CONNECTIONS_DIR, QA_DIR]:
+    for subdir in [CONCEPTS_DIR, CONNECTIONS_DIR, PROJECTS_DIR, QA_DIR]:
         if subdir.exists():
             articles.extend(sorted(subdir.glob("*.md")))
     return articles
@@ -102,7 +110,7 @@ def list_raw_files() -> list[Path]:
     return sorted(DAILY_DIR.glob("*.md"))
 
 
-def near_duplicate_pairs(threshold: float = 0.6) -> list[tuple[str, str, float]]:
+def near_duplicate_pairs(threshold: float = 0.5) -> list[tuple[str, str, float]]:
     """Article pairs whose SLUGS overlap enough that they are probably one topic
     filed twice.
 
@@ -119,22 +127,52 @@ def near_duplicate_pairs(threshold: float = 0.6) -> list[tuple[str, str, float]]
     something nobody notices until a human counts files by hand. It reports on slugs,
     not contents: cheap, and the failure it catches is precisely a naming failure.
 
-    Overlap is |shared tokens| / |tokens of the SHORTER slug|, so a short slug fully
-    contained in a longer one scores 1.0 - which is the common shape here.
+    Overlap is Jaccard - |shared| / |union| - so a pair scores highly only when the two
+    slugs are mostly the SAME words, not merely when one contains the other.
+
+    The default threshold is 0.5, not the 0.6 used with the old measure: Jaccard is
+    strictly harsher, and at 0.6 it MISSED the pm2-resurrect trio entirely (measured
+    2026-09-26: 0 of 3 articles implicated at 0.6, all 3 at 0.5) while still catching
+    the baseline-preserving and one-knowledge-plane piles. A threshold is only
+    meaningful against the measure it was tuned for.
+
+    Two caveats for whoever reads the printed number. It counts PAIRS, which is quadratic
+    in pile size (k articles = k(k-1)/2 pairs), so one bad night can move it by dozens.
+    And it is NOT comparable to the "101 pairs" quoted historically, which used the
+    shorter-slug denominator. Treat it as a trend against its own baseline.
     """
     # Key on the path RELATIVE to knowledge/, not the bare filename: the same slug can
     # exist in concepts/ AND connections/, and reporting just the filename both collapses
     # those into a meaningless self-pair and leaves the reader unable to find the files.
+    return duplicate_pairs_among(
+        [p.relative_to(KNOWLEDGE_DIR).as_posix() for p in list_wiki_articles()],
+        threshold,
+    )
+
+
+def duplicate_pairs_among(slugs: list[str], threshold: float = 0.5) -> list[tuple[str, str, float]]:
+    """The pure half of near_duplicate_pairs(), split out so it can be TESTED.
+
+    The corpus lives under knowledge/, which is gitignored, so a test asserting against
+    the real wiki passes only on this machine and - worse - goes red the moment someone
+    actually collapses a duplicate pile, i.e. it fails for doing the right thing. This
+    function takes the slugs, so a test can pin an exact expected pair set on a fixture.
+    """
     tokenised: list[tuple[str, set[str]]] = []
-    for path in list_wiki_articles():
-        words = {w for w in re.split(r"[-_]", path.stem) if len(w) > 2}
+    for slug in slugs:
+        stem = slug.rsplit("/", 1)[-1].removesuffix(".md")
+        words = {w for w in re.split(r"[-_]", stem) if len(w) > 2}
         if words:
-            tokenised.append((path.relative_to(KNOWLEDGE_DIR).as_posix(), words))
+            tokenised.append((slug, words))
 
     pairs: list[tuple[str, str, float]] = []
     for i, (name_a, words_a) in enumerate(tokenised):
         for name_b, words_b in tokenised[i + 1:]:
-            overlap = len(words_a & words_b) / min(len(words_a), len(words_b))
+            # Jaccard, NOT |shared| / |shorter|. The shorter-slug denominator scores a
+            # perfect 1.0 whenever one slug's tokens are a subset of a longer one's,
+            # however much longer - which saturated the metric (56 pairs at exactly 1.00
+            # on 2026-09-26) and filled the printed top-5 with non-duplicates.
+            overlap = len(words_a & words_b) / len(words_a | words_b)
             if overlap >= threshold:
                 pairs.append((name_a, name_b, round(overlap, 2)))
     return sorted(pairs, key=lambda t: -t[2])
