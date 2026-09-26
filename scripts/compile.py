@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import sys
 from pathlib import Path
 
@@ -24,12 +25,51 @@ from utils import (
     list_raw_files,
     list_wiki_articles,
     load_state,
+    near_duplicate_pairs,
     read_wiki_index,
     save_state,
 )
 
 # ── Paths for the LLM to use ──────────────────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parent.parent
+
+
+def select_log_content(raw: bytes, prev: dict) -> tuple[str, bool]:
+    """Decide what text to hand the compiler for one daily log.
+
+    A daily log GROWS through the day - sessions append to it - and the pending check
+    is hash-based, so every append makes the whole file look new and the WHOLE log is
+    recompiled from scratch. Each pass re-extracts concepts it has already written and,
+    wording them slightly differently each time, mints near-identical articles instead
+    of updating the existing ones. Measured 2026-09-25: 2026-09-25.md was compiled
+    THREE times in one day and produced three articles for a single idea -
+      "pm2 resurrect Ships the Current Working Tree, Not a Point-in-Time Snapshot"
+      "pm2 resurrect Ships Whatever Is Currently on Disk, Not a Code Snapshot"
+      "pm2 resurrect Deploys Current Disk State, Not a Frozen Snapshot"
+    all three citing that one source log, two written a SECOND apart. Corpus-wide that
+    mechanism has produced 101 near-duplicate pairs (WI-bugfix-3cdd9f).
+
+    So when a log has only been APPENDED to, hand over just the new tail and say so.
+    `prev["hash"]` is the hash of the file exactly as it was last compiled, so
+    re-hashing the first `compiled_bytes` bytes is a sufficient append test - no new
+    stored digest is needed. Byte offsets are safe to slice at because that prefix was
+    itself a complete, valid UTF-8 file when it was compiled.
+
+    Anything else - edited, truncated, rewritten, or compiled before `compiled_bytes`
+    existed - falls back to a full recompile, which is the old behaviour.
+
+    Returns (text_to_compile, is_increment).
+    """
+    n = prev.get("compiled_bytes")
+    prior_hash = prev.get("hash")
+    if (
+        isinstance(n, int)
+        and prior_hash
+        and 0 < n < len(raw)
+        and hashlib.sha256(raw[:n]).hexdigest()[:16] == prior_hash
+    ):
+        return raw[n:].decode("utf-8"), True
+    return raw.decode("utf-8"), False
 
 
 async def compile_daily_log(log_path: Path, state: dict) -> float:
@@ -45,7 +85,16 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
         query,
     )
 
-    log_content = log_path.read_text(encoding="utf-8")
+    raw_bytes = log_path.read_bytes()
+    prev_entry = (state.get("ingested") or {}).get(log_path.name) or {}
+    log_content, is_increment = select_log_content(raw_bytes, prev_entry)
+    increment_note = (
+        "  **INCREMENT** - this day was already compiled. What follows is ONLY the text"
+        " appended since. Everything before it ALREADY HAS ARTICLES: update those, never"
+        " re-create them under a new title."
+        if is_increment
+        else ""
+    )
     schema = AGENTS_FILE.read_text(encoding="utf-8")
     wiki_index = read_wiki_index()
 
@@ -104,7 +153,7 @@ a concept. Only read the articles this daily log actually touches - do not read 
 
 ## Daily Log to Compile
 
-**File:** {log_path.name}
+**File:** {log_path.name}{increment_note}
 
 {log_content}
 
@@ -114,7 +163,14 @@ Read the daily log above and compile it into wiki articles following the schema 
 
 ### Rules:
 
-1. **Extract key concepts** - Identify 3-7 distinct concepts worth their own article
+1. **Extract key concepts, then CONSOLIDATE your list BEFORE writing anything.**
+   Identify 3-7 concepts worth their own article. Then re-read your own list and MERGE
+   any two that are the same idea worded differently. If two titles would share most of
+   their significant words they are ONE concept - for example "X Ships the Current
+   Working Tree", "X Ships Whatever Is Currently on Disk" and "X Deploys Current Disk
+   State" are one article, not three. Writing near-identical articles within a single
+   pass is the LARGEST source of duplication in this wiki, and searching cannot catch
+   it, because neither article exists yet at the moment you plan them both.
 
 2. **For EACH concept, SEARCH BEFORE YOU WRITE.** Grep `knowledge/concepts/` for the
    concept's distinctive words, and scan the article-path list above. Search for
@@ -215,6 +271,9 @@ Read the daily log above and compile it into wiki articles following the schema 
     rel_path = log_path.name
     state.setdefault("ingested", {})[rel_path] = {
         "hash": file_hash(log_path),
+        # How many bytes of this log have now been compiled. select_log_content() uses
+        # it to send only the appended tail next time instead of the whole log again.
+        "compiled_bytes": log_path.stat().st_size,
         "compiled_at": now_iso(),
         "cost_usd": cost,
     }
@@ -279,6 +338,15 @@ def main():
     articles = list_wiki_articles()
     print(f"\nCompilation complete. Total cost: ${total_cost:.2f}")
     print(f"Knowledge base: {len(articles)} articles")
+
+    # Duplication is otherwise invisible: nobody notices a synonym pile until someone
+    # counts files by hand. Printing the count on every run makes it a trend the
+    # nightly log carries, so a regression shows up as a rising number, and a fix
+    # has something to be measured against (WI-bugfix-3cdd9f).
+    dupes = near_duplicate_pairs()
+    print(f"Near-duplicate article pairs: {len(dupes)}")
+    for name_a, name_b, overlap in dupes[:5]:
+        print(f"  {overlap:.2f}  {name_a}  <->  {name_b}")
 
 
 if __name__ == "__main__":

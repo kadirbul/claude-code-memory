@@ -102,6 +102,44 @@ def list_raw_files() -> list[Path]:
     return sorted(DAILY_DIR.glob("*.md"))
 
 
+def near_duplicate_pairs(threshold: float = 0.6) -> list[tuple[str, str, float]]:
+    """Article pairs whose SLUGS overlap enough that they are probably one topic
+    filed twice.
+
+    WHY: the compiler mints a fresh article for a concept it has already written,
+    under reworded titles, so the corpus accretes synonym piles that make recall
+    ambiguous - a lookup returns six articles saying the same thing and neither the
+    reader nor an agent can tell which is current. Measured 2026-09-25 across 603
+    articles: 101 pairs over this threshold, 8 exact word-for-word permutations
+    (`ssrf-unvalidated-urlopen-scheme` / `urlopen-ssrf-unvalidated-scheme`), and
+    SEVEN articles on the One Knowledge Plane programme alone.
+
+    This does not fix anything - it makes the problem VISIBLE. compile.py prints the
+    count on every run, so the number is a trend the nightly log carries instead of
+    something nobody notices until a human counts files by hand. It reports on slugs,
+    not contents: cheap, and the failure it catches is precisely a naming failure.
+
+    Overlap is |shared tokens| / |tokens of the SHORTER slug|, so a short slug fully
+    contained in a longer one scores 1.0 - which is the common shape here.
+    """
+    # Key on the path RELATIVE to knowledge/, not the bare filename: the same slug can
+    # exist in concepts/ AND connections/, and reporting just the filename both collapses
+    # those into a meaningless self-pair and leaves the reader unable to find the files.
+    tokenised: list[tuple[str, set[str]]] = []
+    for path in list_wiki_articles():
+        words = {w for w in re.split(r"[-_]", path.stem) if len(w) > 2}
+        if words:
+            tokenised.append((path.relative_to(KNOWLEDGE_DIR).as_posix(), words))
+
+    pairs: list[tuple[str, str, float]] = []
+    for i, (name_a, words_a) in enumerate(tokenised):
+        for name_b, words_b in tokenised[i + 1:]:
+            overlap = len(words_a & words_b) / min(len(words_a), len(words_b))
+            if overlap >= threshold:
+                pairs.append((name_a, name_b, round(overlap, 2)))
+    return sorted(pairs, key=lambda t: -t[2])
+
+
 # ── Index helpers ─────────────────────────────────────────────────────
 
 def count_inbound_links(target: str, exclude_file: Path | None = None) -> int:
