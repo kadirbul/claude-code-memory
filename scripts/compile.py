@@ -72,6 +72,30 @@ def select_log_content(raw: bytes, prev: dict) -> tuple[str, bool]:
     return raw.decode("utf-8"), False
 
 
+def state_entry(raw: bytes, cost: float) -> dict:
+    """Build the ingested-state record for content that was JUST compiled.
+
+    Both fields describe `raw` - the bytes actually handed to the compiler - and NOT a
+    fresh read of the file. This matters: a compile takes ~90 seconds and sessions
+    append to the daily log the whole time, so the file on disk is usually LONGER by
+    the time this runs. Re-reading it here (which is what this did until 2026-09-26)
+    records a hash and a length covering text that was never compiled, and
+    select_log_content() then starts the next run PAST it - so whatever was appended
+    DURING a compile would never be compiled at all.
+
+    That was harmless before incremental compiling existed: a hash that disagreed with
+    the file just meant "recompile the whole log", which redid work but lost nothing.
+    With the tail optimisation it becomes silent knowledge loss, which is the one
+    failure this whole change must not introduce.
+    """
+    return {
+        "hash": hashlib.sha256(raw).hexdigest()[:16],
+        "compiled_bytes": len(raw),
+        "compiled_at": now_iso(),
+        "cost_usd": cost,
+    }
+
+
 async def compile_daily_log(log_path: Path, state: dict) -> float:
     """Compile a single daily log into knowledge articles.
 
@@ -269,14 +293,7 @@ Read the daily log above and compile it into wiki articles following the schema 
 
     # Update state
     rel_path = log_path.name
-    state.setdefault("ingested", {})[rel_path] = {
-        "hash": file_hash(log_path),
-        # How many bytes of this log have now been compiled. select_log_content() uses
-        # it to send only the appended tail next time instead of the whole log again.
-        "compiled_bytes": log_path.stat().st_size,
-        "compiled_at": now_iso(),
-        "cost_usd": cost,
-    }
+    state.setdefault("ingested", {})[rel_path] = state_entry(raw_bytes, cost)
     state["total_cost"] = state.get("total_cost", 0.0) + cost
     save_state(state)
 
