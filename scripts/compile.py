@@ -174,11 +174,26 @@ Read the daily log above and compile it into wiki articles following the schema 
                 # pricing with comparable quality on this kind of agentic file work.
                 # Pinning also stops a future SDK default from silently moving our costs.
                 model="claude-sonnet-5",
-                # Hard per-file spend ceiling. A normal daily log compiles for well under
-                # $1; this is ~6x headroom, so it never trips in normal operation but caps
-                # a regression instead of discovering it in the morning. On 2026-07-26 a
-                # single unbounded run cost $45.31 (see the prompt-size comment above).
-                max_budget_usd=2.00,
+                # Hard per-file ceiling. NOT a billing guard - this runs on a Max
+                # subscription (no ANTHROPIC_API_KEY in any scope; ~/.claude/.credentials
+                # .json carries claudeAiOauth subscriptionType=max), so the figure is the
+                # API-EQUIVALENT cost of the tokens, not money charged. What it actually
+                # bounds is Max rate-limit capacity consumed by an unattended 22:00 job:
+                # the 2026-07-26 runaway burned $45.31-equivalent, which shows up not as a
+                # bill but as the owner being throttled mid-morning for no visible reason.
+                # It is also this job's only regression detector - nothing else watches it.
+                #
+                # Raised 2.00 -> 4.00 on 2026-09-25. The old value's premise ("~6x headroom,
+                # never trips in normal operation") was measured when the corpus was 324
+                # articles and a log cost ~$0.33. At 645 articles normal operation is ~$2
+                # (the prompt carries every article path, re-sent across up to 30 turns), so
+                # the ceiling had started aborting real work: 2026-09-22 (18.7 KB) failed
+                # twice at $2.24 and $1.88, while 2026-09-25 succeeded at $1.99 and failed
+                # at $2.06 - the boundary, not the content, decided the outcome. 4.00 keeps
+                # ~2x headroom over current normal, still tight enough to catch a runaway.
+                # This treats the SYMPTOM. The cause - cost decoupled from log size as the
+                # corpus grows - is tracked separately; see the prompt-size comment above.
+                max_budget_usd=4.00,
                 system_prompt={"type": "preset", "preset": "claude_code"},
                 allowed_tools=["Read", "Write", "Edit", "Glob", "Grep"],
                 permission_mode="acceptEdits",
