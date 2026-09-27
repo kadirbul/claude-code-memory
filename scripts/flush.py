@@ -29,6 +29,13 @@ SCRIPTS_DIR = ROOT / "scripts"
 STATE_FILE = SCRIPTS_DIR / "last-flush.json"
 LOG_FILE = SCRIPTS_DIR / "flush.log"
 
+# Recursion-guard lock file. session-end.py checks for this — while it exists
+# (and is fresh) no new flush is spawned, because the Claude Agent SDK call
+# inside this flush starts its own Claude Code session whose SessionEnd hook
+# would otherwise recurse. See session-end.py "Recursion guard" for the full
+# story (the 2026-05-07 runaway: 5,094 flushes / 2 days).
+FLUSH_LOCK = SCRIPTS_DIR / "flush.lock"
+
 # Set up file-based logging so we can verify the background process ran.
 # The parent process sends stdout/stderr to DEVNULL (to avoid the inherited
 # file handle bug on Windows), so this is our only observability channel.
@@ -268,8 +275,20 @@ def main():
             target_date=target_date,
         )
     elif "FLUSH_ERROR" in response:
+        # A failed flush PRESERVES its input instead of consuming it (WI-bugfix-4d7e21).
+        # This branch used to append the error TEXT to the daily log - where compile.py
+        # then read it as knowledge - and then fall through to record the session as
+        # flushed and unlink the context file. A transient SDK failure therefore became
+        # permanent silent loss: 1525 error stanzas across 142 daily logs, 12 days whose
+        # log held nothing else, and a 22-session backfill on 2026-09-25 deleted outright.
+        #
+        # Returning here leaves the capture on disk AND the session unrecorded, so the
+        # 30-minute dedup window does not apply and the next flush for this session
+        # retries it. It also skips maybe_trigger_compilation(), which is correct: there
+        # is nothing new to compile.
         logging.error("Result: %s", response)
-        append_to_daily_log(response, "Memory Flush", target_date=target_date)
+        logging.error("PRESERVED for retry - not recorded, nothing appended: %s", context_file)
+        return
     else:
         logging.info("Result: saved to daily log (%d chars)", len(response))
         append_to_daily_log(response, "Session", target_date=target_date)
@@ -292,5 +311,31 @@ def main():
     logging.info("Flush complete for session %s", session_id)
 
 
+def _acquire_lock() -> None:
+    """Write the recursion-guard lock with this process's PID + start time."""
+    try:
+        FLUSH_LOCK.write_text(
+            json.dumps({"pid": os.getpid(), "started": time.time()}),
+            encoding="utf-8",
+        )
+    except OSError as e:
+        logging.warning("Could not write flush.lock: %s", e)
+
+
+def _release_lock() -> None:
+    try:
+        FLUSH_LOCK.unlink(missing_ok=True)
+    except OSError as e:
+        logging.warning("Could not remove flush.lock: %s", e)
+
+
 if __name__ == "__main__":
-    main()
+    # Hold the recursion-guard lock for the WHOLE flush, including the Agent
+    # SDK call. session-end.py refuses to spawn while this lock is fresh, so
+    # the child Claude Code session the SDK starts cannot trigger another
+    # flush. Always released — even on crash — via try/finally.
+    _acquire_lock()
+    try:
+        main()
+    finally:
+        _release_lock()
