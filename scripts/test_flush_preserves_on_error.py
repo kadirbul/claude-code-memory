@@ -68,13 +68,14 @@ def _run(monkeyed_response: str, tmp: Path, *, session_id: str = "sess-1",
     flush.run_flush = _stub
     flush.maybe_trigger_compilation = lambda: None          # never spawn a real compile
     sys.argv = ["flush.py", str(ctx), session_id, "2026-01-01"]
-    flush.main()
+    rc = flush.main()
 
     logs = sorted(daily.glob("*.md"))
     return {
         "context_survived": ctx.exists(),
         "state": json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {},
         "log_text": logs[0].read_text(encoding="utf-8") if logs else "",
+        "rc": rc,
     }
 
 
@@ -131,6 +132,49 @@ def main() -> int:
                  prior_state={"sessions": {"sess-4": _t.time()}, "last_session_id": "sess-4"})
         check("a duplicate inside the window consumes the context and writes nothing",
               not r["context_survived"] and r["log_text"] == "")
+
+        # ── classification is by MARKER, not by substring (review of 74757f0) ──────
+        print("\na GENUINE summary that MENTIONS FLUSH_ERROR must be SAVED, not discarded")
+        # The first version of this guard used `\"FLUSH_ERROR\" in response`, so any real
+        # summary discussing this pipeline - near-certain in THIS repo - was thrown away.
+        real = ("Fixed the flush guard: a FLUSH_ERROR no longer deletes the capture. "
+                "1525 FLUSH_ERROR stanzas were already lost.")
+        r = _run(real, tmp, session_id="sess-5")
+        check("saved to the daily log as content", "no longer deletes the capture" in r["log_text"])
+        check("context consumed, because it succeeded", not r["context_survived"])
+        check("session recorded, because it succeeded", "sess-5" in (r["state"].get("sessions") or {}))
+        check("exit code 0", r["rc"] in (0, None))
+
+        print("\nan SDK error that ECHOES the prompt must NOT be taken for FLUSH_OK")
+        # The prompt contains the literal 'respond with exactly: FLUSH_OK', and FLUSH_OK was
+        # tested FIRST with `in`, so an echo took the success branch: logged as nothing worth
+        # saving, session recorded, capture deleted - the very loss this ticket is about.
+        echo = "Error: the model echoed the instructions: respond with exactly: FLUSH_OK if ..."
+        r = _run(echo, tmp, session_id="sess-6")
+        check("NOT recorded as 'nothing worth saving'",
+              "Nothing worth saving" not in r["log_text"])
+        check("kept as content instead (fail-safe: saved, never deleted)",
+              "echoed the instructions" in r["log_text"])
+
+        print("\nexit codes - so backfill.py and run_flush.bat cannot report a false green")
+        r = _run("FLUSH_ERROR: Exception: boom", tmp, session_id="sess-7")
+        check("a preserved failure exits NON-ZERO", r["rc"] == 1)
+        check("and still preserves the capture", r["context_survived"])
+
+        print("\nthe recursion guard is owned, and fails CLOSED")
+        lock = tmp / "flush.lock"
+        flush.FLUSH_LOCK = lock
+        check("acquire writes the lock and reports success", flush._acquire_lock() is True)
+        check("the lock records this process", json.loads(lock.read_text(encoding="utf-8"))["pid"] == __import__("os").getpid())
+        lock.write_text(json.dumps({"pid": 999999, "started": 0}), encoding="utf-8")
+        flush._release_lock()
+        check("release does NOT remove a lock owned by another flush still running",
+              lock.exists())
+        check("acquire retakes it, then release removes its own",
+              flush._acquire_lock() and (flush._release_lock() or not lock.exists()))
+        flush.FLUSH_LOCK = tmp / "no-such-dir" / "flush.lock"
+        check("acquire FAILS CLOSED when the lock cannot be written",
+              flush._acquire_lock() is False)
 
     print()
     if FAILURES:

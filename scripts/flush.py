@@ -267,14 +267,18 @@ def main():
     # Run the LLM extraction
     response = asyncio.run(run_flush(context))
 
-    # Append to daily log
-    if "FLUSH_OK" in response:
-        logging.info("Result: FLUSH_OK")
-        append_to_daily_log(
-            "FLUSH_OK - Nothing worth saving from this session", "Memory Flush",
-            target_date=target_date,
-        )
-    elif "FLUSH_ERROR" in response:
+    # Classify on the MARKER, not on a substring found anywhere in the text, and test the
+    # ERROR marker first. Both halves of the original ordering were wrong:
+    #   - `"FLUSH_OK" in response` also matched an SDK error that echoed the prompt, and
+    #     the prompt contains the literal `respond with exactly: FLUSH_OK`. A failure then
+    #     took the SUCCESS branch: logged as "nothing worth saving", session recorded,
+    #     context file deleted - exactly the loss WI-bugfix-4d7e21 exists to stop.
+    #   - `"FLUSH_ERROR" in response` also matched a GENUINE summary that merely mentions
+    #     the token, which is near-certain in this repo, whose sessions discuss this very
+    #     pipeline. Real knowledge was then thrown away as if it were an error.
+    # run_flush() mints both markers as a prefix, so anchor on that. Anything else counts
+    # as content and gets SAVED, which is the fail-safe direction.
+    if response.startswith("FLUSH_ERROR:"):
         # A failed flush PRESERVES its input instead of consuming it (WI-bugfix-4d7e21).
         # This branch used to append the error TEXT to the daily log - where compile.py
         # then read it as knowledge - and then fall through to record the session as
@@ -282,13 +286,21 @@ def main():
         # permanent silent loss: 1525 error stanzas across 142 daily logs, 12 days whose
         # log held nothing else, and a 22-session backfill on 2026-09-25 deleted outright.
         #
-        # Returning here leaves the capture on disk AND the session unrecorded, so the
-        # 30-minute dedup window does not apply and the next flush for this session
-        # retries it. It also skips maybe_trigger_compilation(), which is correct: there
-        # is nothing new to compile.
+        # Returning leaves the capture on disk and the session unrecorded, and skips
+        # maybe_trigger_compilation(), which is right - nothing new was compiled.
+        # NOTE, deliberately not overstated: nothing re-reads a preserved file today. All
+        # three producers mint a NEW timestamped context file, so there is no retry
+        # consumer and these are manual-recovery material (WI-bugfix-1b9f04).
+        # Exits NON-ZERO so backfill.py and run_flush.bat cannot report a false green.
         logging.error("Result: %s", response)
-        logging.error("PRESERVED for retry - not recorded, nothing appended: %s", context_file)
-        return
+        logging.error("PRESERVED, not recorded and nothing appended: %s", context_file)
+        return 1
+    if response.strip() == "FLUSH_OK":
+        logging.info("Result: FLUSH_OK")
+        append_to_daily_log(
+            "FLUSH_OK - Nothing worth saving from this session", "Memory Flush",
+            target_date=target_date,
+        )
     else:
         logging.info("Result: saved to daily log (%d chars)", len(response))
         append_to_daily_log(response, "Session", target_date=target_date)
@@ -309,23 +321,47 @@ def main():
     maybe_trigger_compilation()
 
     logging.info("Flush complete for session %s", session_id)
+    return 0
 
 
-def _acquire_lock() -> None:
-    """Write the recursion-guard lock with this process's PID + start time."""
+def _acquire_lock() -> bool:
+    """Write the recursion-guard lock with this process's PID + start time.
+
+    Returns False if the lock could NOT be established. The caller must then refuse to
+    flush: this guard is what stops the Agent SDK's own child session from triggering
+    another flush, and the 2026-05-07 runaway was 5,094 flushes over two days. A safety
+    check that proceeds when it cannot be established is a check that fails OPEN, so the
+    answer to "I could not write the lock" is "then do not run", not "run anyway".
+    """
     try:
         FLUSH_LOCK.write_text(
             json.dumps({"pid": os.getpid(), "started": time.time()}),
             encoding="utf-8",
         )
+        return True
     except OSError as e:
-        logging.warning("Could not write flush.lock: %s", e)
+        logging.error("Could not write flush.lock, refusing to flush: %s", e)
+        return False
 
 
 def _release_lock() -> None:
+    """Release the lock ONLY if this process owns it.
+
+    An unconditional unlink strips the guard off a DIFFERENT flush that is still inside
+    its SDK call: two near-simultaneous flushes, the second overwrites the lock with its
+    own PID, the first finishes and deletes it, and the second now runs unguarded - the
+    runaway path again. Whoever owns the lock releases it; a crashed owner is covered by
+    session-end.py's 600-second staleness window.
+    """
     try:
+        if not FLUSH_LOCK.exists():
+            return
+        owner = json.loads(FLUSH_LOCK.read_text(encoding="utf-8")).get("pid")
+        if owner != os.getpid():
+            logging.info("Not releasing flush.lock: owned by pid %s, not %s", owner, os.getpid())
+            return
         FLUSH_LOCK.unlink(missing_ok=True)
-    except OSError as e:
+    except (OSError, ValueError) as e:
         logging.warning("Could not remove flush.lock: %s", e)
 
 
@@ -334,8 +370,10 @@ if __name__ == "__main__":
     # SDK call. session-end.py refuses to spawn while this lock is fresh, so
     # the child Claude Code session the SDK starts cannot trigger another
     # flush. Always released — even on crash — via try/finally.
-    _acquire_lock()
+    if not _acquire_lock():
+        raise SystemExit(2)          # fail CLOSED - see _acquire_lock
     try:
-        main()
+        # SystemExit still runs the finally below, so the lock is released either way.
+        raise SystemExit(main() or 0)
     finally:
         _release_lock()
