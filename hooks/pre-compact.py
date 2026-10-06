@@ -20,13 +20,24 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Recursion guard
-if os.environ.get("CLAUDE_INVOKED_BY"):
-    sys.exit(0)
-
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = ROOT / "scripts"
 STATE_DIR = SCRIPTS_DIR
+
+# Recursion guard (hardened 2026-05-18) — see session-end.py for the full
+# story. Env var = fast path; flush.lock = reliable check that does not
+# depend on env inheritance through the Agent SDK on Windows.
+if os.environ.get("CLAUDE_INVOKED_BY"):
+    sys.exit(0)
+
+_FLUSH_LOCK = SCRIPTS_DIR / "flush.lock"
+if _FLUSH_LOCK.exists():
+    try:
+        import time as _t
+        if _t.time() - _FLUSH_LOCK.stat().st_mtime < 600:
+            sys.exit(0)  # a flush is in flight — this is its descendant
+    except OSError:
+        sys.exit(0)
 
 logging.basicConfig(
     filename=str(SCRIPTS_DIR / "flush.log"),
@@ -141,8 +152,15 @@ def main() -> None:
     # Spawn flush.py as a background process
     flush_script = SCRIPTS_DIR / "flush.py"
 
+    import shutil as _shutil
+    uv_exe = (
+        _shutil.which("uv")
+        or _shutil.which("uv.exe")
+        or str(Path.home() / ".local" / "bin" / "uv.exe")
+    )
+
     cmd = [
-        "uv",
+        uv_exe,
         "run",
         "--directory",
         str(ROOT),

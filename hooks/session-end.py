@@ -19,15 +19,43 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Recursion guard: if we were spawned by flush.py (which calls Agent SDK,
-# which runs Claude Code, which would fire this hook again), exit immediately.
-if os.environ.get("CLAUDE_INVOKED_BY"):
-    sys.exit(0)
-
 ROOT = Path(__file__).resolve().parent.parent
 DAILY_DIR = ROOT / "daily"
 SCRIPTS_DIR = ROOT / "scripts"
 STATE_DIR = SCRIPTS_DIR
+
+# ── Recursion guard (hardened 2026-05-18) ───────────────────────────────────
+# flush.py calls the Claude Agent SDK, which runs a bundled claude.exe; when
+# THAT session ends it fires this very hook again. If the guard fails, each
+# flush spawns another flush — observed 2026-05-07: 1,849 runaway sessions in
+# one day, 5,094 flushes over two days.
+#
+# Two independent checks (belt + suspenders) — the env var alone is unreliable
+# because it does not propagate cleanly through `uv run` → Agent SDK → the
+# bundled binary on Windows:
+#   1. CLAUDE_INVOKED_BY env var — fast path, works when env IS inherited.
+#   2. flush.lock file — flush.py writes it while a flush is in flight (with
+#      its PID + a stale-timeout). If a flush is active, ANY session-end is a
+#      descendant of it and must not spawn again. This does not depend on env
+#      inheritance at all.
+_FLUSH_LOCK = SCRIPTS_DIR / "flush.lock"
+_FLUSH_LOCK_STALE_S = 600  # a flush should never legitimately run >10 min
+
+if os.environ.get("CLAUDE_INVOKED_BY"):
+    sys.exit(0)
+
+if _FLUSH_LOCK.exists():
+    try:
+        import time as _t
+        age = _t.time() - _FLUSH_LOCK.stat().st_mtime
+        if age < _FLUSH_LOCK_STALE_S:
+            # A flush is in flight — this session-end belongs to its child
+            # Claude Code process. Do NOT spawn another flush.
+            sys.exit(0)
+        # Stale lock (flush crashed without cleanup) — ignore and proceed;
+        # flush.py will overwrite it.
+    except OSError:
+        sys.exit(0)  # can't stat the lock — fail safe, don't spawn
 
 logging.basicConfig(
     filename=str(SCRIPTS_DIR / "flush.log"),
@@ -161,6 +189,22 @@ def main() -> None:
     if turn_count < MIN_TURNS_TO_FLUSH:
         logging.info("SKIP: only %d turns (min %d)", turn_count, MIN_TURNS_TO_FLUSH)
         return
+
+    # Hook 3B — requirements registry sync (phase: requirements-management).
+    # Replay any cr.status_changed events that fired during this session and
+    # sync requirements.json for affected products. Pure Python, no API calls,
+    # no FastAPI dependency — safe to run inline here.
+    try:
+        _brain_os_root = Path(os.environ.get("BRAIN_OS_ROOT", "C:/claude-code/brain-os"))
+        _tools_path = str(_brain_os_root / "tools")
+        if _tools_path not in sys.path:
+            sys.path.insert(0, _tools_path)
+        from requirements_sync import process_session_events as _process_session_events
+        _req_log = _process_session_events()
+        if _req_log:
+            logging.info("requirements_sync: %s", "; ".join(_req_log))
+    except Exception as _req_err:
+        logging.warning("requirements_sync failed (non-fatal): %s", _req_err)
 
     # Write context to a temp file for the background process
     timestamp = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S")
