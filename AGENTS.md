@@ -308,8 +308,12 @@ llm-personal-kb/
 |   |-- query.py                     #   Ask questions (index-guided, no RAG)
 |   |-- lint.py                      #   7 health checks
 |   |-- flush.py                     #   Extract memories from conversations (background)
+|   |-- backfill.py                  #   Re-flush historical transcripts (multi-day sessions); skips machine runs (`sdk-*` entrypoints, `claude-code-isolated` cwd)
 |   |-- config.py                    #   Path constants
 |   |-- utils.py                     #   Shared helpers
+|   |-- create_schedule.bat          #   (Windows) Register Task Scheduler tasks once
+|   |-- run_compile.bat              #   (Windows) Task Scheduler wrapper for compile.py (local, not in git)
+|   |-- run_flush.bat                #   (Windows) Task Scheduler wrapper for backfill.py (local, not in git)
 |-- hooks/                           # Claude Code hooks
 |   |-- session-start.py             #   Injects knowledge into every session
 |   |-- session-end.py               #   Extracts conversation -> daily log
@@ -350,7 +354,7 @@ Commands use simple relative paths from the project root. Empty `matcher` catche
 - Reads hook input from stdin (JSON with `session_id`, `transcript_path`, `cwd`)
 - Copies the raw JSONL transcript to a temp file (no parsing in the hook - keeps it fast)
 - Spawns `flush.py` as a fully detached background process
-- Recursion guard: exits immediately if `CLAUDE_INVOKED_BY` env var is set
+- Recursion guard: two independent checks — exits immediately if `CLAUDE_INVOKED_BY` env var is set (fast path), OR if `scripts/flush.lock` exists and is fresh (reliable path, works even when env isn't inherited through `uv run` → Agent SDK on Windows)
 
 **`pre-compact.py`** (PreCompact)
 - Same architecture as session-end.py
@@ -362,21 +366,22 @@ Commands use simple relative paths from the project root. Empty `matcher` catche
 
 ### Background Flush Process (`flush.py`)
 
-Spawned by both hooks as a fully detached background process:
-- **Windows:** `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS` flags
+Spawned by both hooks as a background process:
+- **Windows:** `CREATE_NO_WINDOW` flag (NOT `DETACHED_PROCESS` — that breaks Agent SDK subprocess I/O)
 - **Mac/Linux:** `start_new_session=True`
 
-This ensures flush.py survives after Claude Code's hook process exits.
+**Recursion guard:** flush.py holds a `scripts/flush.lock` file for its entire lifetime (including the Agent SDK call). Both hooks check this lock at startup and exit immediately if it's fresh (< 10 min old). This is the primary defense against recursive flush loops — the env-var check alone is unreliable because `CLAUDE_INVOKED_BY` doesn't propagate cleanly through `uv run` → Agent SDK → bundled binary on Windows. The lock does not depend on env inheritance at all.
 
 **What flush.py does:**
-1. Sets `CLAUDE_INVOKED_BY=memory_flush` env var (prevents recursive hook firing)
-2. Reads the pre-extracted conversation context from the temp `.md` file
-3. Skips if context is empty or if same session was flushed within 60 seconds (deduplication)
-4. Calls Claude Agent SDK (`query()` with `allowed_tools=[]`, `max_turns=2`)
-5. Claude decides what's worth saving - returns structured bullet points or `FLUSH_OK`
-6. Appends result to `daily/YYYY-MM-DD.md`
-7. Cleans up temp context file
-8. **End-of-day auto-compilation:** If it's past 6 PM local time (`COMPILE_AFTER_HOUR = 18`) and today's daily log has changed since its last compilation (hash comparison against `state.json`), spawns `compile.py` as another detached background process. This means compilation happens automatically once a day without needing a cron job or manual trigger.
+1. Acquires `scripts/flush.lock` (recursion guard — held until exit)
+2. Sets `CLAUDE_INVOKED_BY=memory_flush` env var (fast-path guard for when env IS inherited)
+3. Reads the pre-extracted conversation context from the temp `.md` file
+4. Skips if context is empty or if same session was flushed within 30 minutes (deduplication)
+5. Calls Claude Agent SDK (`query()` with `allowed_tools=[]`, `max_turns=2`, `model="claude-haiku-4-5-20251001"`)
+6. Claude decides what's worth saving - returns structured bullet points or `FLUSH_OK`
+7. Appends result to `daily/YYYY-MM-DD.md`
+8. Cleans up temp context file and releases `flush.lock`
+9. **No compile trigger.** flush.py used to spawn `compile.py` after every flush past 18:00; each flush changes today's log hash, so a busy evening ran 30-50 full compiles (85 on 2026-10-04/05). Compilation now runs once a night from the `BrainOS-MemoryCompile` scheduled task (`run_compile.bat`).
 
 ### JSONL Transcript Format
 
