@@ -167,6 +167,35 @@ def transcript_mtime_date(p: Path) -> str:
     return mt.strftime("%Y-%m-%d")
 
 
+def is_machine_session(p: Path) -> bool:
+    """True for headless Agent SDK / `claude -p` runs (entrypoint "sdk-cli",
+    or "sdk-py" for the Python Agent SDK this memory system itself uses).
+
+    Those are product LLM calls and this memory system's own flush/compile
+    runs - flushing them costs an LLM call each and captures nothing a human
+    said. Interactive sessions carry "cli" / "claude-vscode" instead.
+    """
+    # Product LLM calls via shared/lib/llm.py run `claude -p` from this temp
+    # cwd and inherit the parent's entrypoint ("claude-vscode"), so the folder
+    # is the only reliable marker for them.
+    if "claude-code-isolated" in p.parent.name:
+        return True
+    try:
+        with p.open(encoding="utf-8", errors="ignore") as fh:
+            for i, line in enumerate(fh):
+                if i >= 20:
+                    break
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "entrypoint" in entry:
+                    return str(entry["entrypoint"]).startswith("sdk-")
+    except OSError:
+        pass
+    return False
+
+
 def find_transcripts(
     dates: set[str],
     session_filter: str | None,
@@ -200,7 +229,8 @@ def find_transcripts(
                 matches.append(jsonl)
                 continue
             if not dates or transcript_mtime_date(jsonl) in dates:
-                matches.append(jsonl)
+                if not is_machine_session(jsonl):
+                    matches.append(jsonl)
     return sorted(matches, key=lambda p: p.stat().st_mtime)
 
 

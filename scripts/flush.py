@@ -142,6 +142,9 @@ respond with exactly: FLUSH_OK
                 cwd=str(ROOT),
                 allowed_tools=[],
                 max_turns=2,
+                # Pinned: unset inherited the account default (Opus) for a
+                # 2-turn summarisation that Haiku handles fine.
+                model="claude-haiku-4-5-20251001",
             ),
         ):
             if isinstance(message, AssistantMessage):
@@ -156,67 +159,6 @@ respond with exactly: FLUSH_OK
         response = f"FLUSH_ERROR: {type(e).__name__}: {e}"
 
     return response
-
-
-COMPILE_AFTER_HOUR = 18  # 6 PM local time
-
-
-def maybe_trigger_compilation() -> None:
-    """If it's past the compile hour and today's log hasn't been compiled, run compile.py."""
-    import subprocess as _sp
-
-    now = datetime.now(timezone.utc).astimezone()
-    if now.hour < COMPILE_AFTER_HOUR:
-        return
-
-    # Check if today's log has already been compiled
-    today_log = f"{now.strftime('%Y-%m-%d')}.md"
-    compile_state_file = SCRIPTS_DIR / "state.json"
-    if compile_state_file.exists():
-        try:
-            compile_state = json.loads(compile_state_file.read_text(encoding="utf-8"))
-            ingested = compile_state.get("ingested", {})
-            if today_log in ingested:
-                # Already compiled today - check if the log has changed since
-                from hashlib import sha256
-                log_path = DAILY_DIR / today_log
-                if log_path.exists():
-                    current_hash = sha256(log_path.read_bytes()).hexdigest()[:16]
-                    if ingested[today_log].get("hash") == current_hash:
-                        return  # log unchanged since last compile
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    compile_script = SCRIPTS_DIR / "compile.py"
-    if not compile_script.exists():
-        return
-
-    logging.info("End-of-day compilation triggered (after %d:00)", COMPILE_AFTER_HOUR)
-
-    # Resolve uv.exe with full path — Windows subprocess.Popen does not
-    # search PATH the same way the shell does, so unqualified `uv` fails
-    # with WinError 2 even when uv is on PATH for an interactive shell.
-    import shutil as _shutil
-    uv_exe = (
-        _shutil.which("uv")
-        or _shutil.which("uv.exe")
-        or str(Path.home() / ".local" / "bin" / "uv.exe")
-    )
-    cmd = [uv_exe, "run", "--directory", str(ROOT), "python", str(compile_script)]
-
-    kwargs: dict = {}
-    if sys.platform == "win32":
-        # Use CREATE_NO_WINDOW — DO NOT use DETACHED_PROCESS as it breaks
-        # the Agent SDK's subprocess I/O (compile.py calls Claude Agent SDK).
-        kwargs["creationflags"] = _sp.CREATE_NO_WINDOW
-    else:
-        kwargs["start_new_session"] = True
-
-    try:
-        log_handle = open(str(SCRIPTS_DIR / "compile.log"), "a")
-        _sp.Popen(cmd, stdout=log_handle, stderr=_sp.STDOUT, cwd=str(ROOT), **kwargs)
-    except Exception as e:
-        logging.error("Failed to spawn compile.py: %s", e)
 
 
 def main():
@@ -316,9 +258,10 @@ def main():
     # Clean up context file
     context_file.unlink(missing_ok=True)
 
-    # End-of-day auto-compilation: if it's past the compile hour and today's
-    # log hasn't been compiled yet, trigger compile.py in the background.
-    maybe_trigger_compilation()
+    # No compile trigger here. It used to spawn compile.py after every flush past
+    # 18:00, and since each flush changes today's log hash, a busy evening ran
+    # 30-50 full Sonnet compiles (85 on 2026-10-04/05). The nightly
+    # BrainOS-MemoryCompile task compiles once a day instead.
 
     logging.info("Flush complete for session %s", session_id)
     return 0
