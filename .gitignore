@@ -10,6 +10,11 @@ scripts/flush.log
 scripts/compile.log
 scripts/session-flush-*
 scripts/flush-context-*
+scripts/flush.lock
+scripts/pkb_freshness.json
+scripts/scheduled_flush.log
+scripts/scheduled_compile.log
+scripts/backfill-*.md
 
 # Generated content (built up per-user by hooks and scripts)
 daily/
@@ -29,3 +34,6 @@ scripts/uv.lock
 Thumbs.db
 
 .obsidian/
+dashboard.md.md
+*.canvas
+*.base
