@@ -59,8 +59,8 @@ def _assistant(text: str, error: str | None = None) -> AssistantMessage:
     return AssistantMessage(content=[TextBlock(text=text)], model="<synthetic>" if error else "claude-haiku-4-5", error=error)
 
 
-def _result() -> ResultMessage:
-    return ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+def _result(subtype: str = "success", is_error: bool = False) -> ResultMessage:
+    return ResultMessage(subtype=subtype, duration_ms=1, duration_api_ms=1, is_error=is_error,
                          num_turns=1, session_id="s")
 
 
@@ -98,7 +98,14 @@ def main() -> int:
     print("\nusage limit, CLI exits 0 (how 2026-05-07 / 06-25 saved error text AS knowledge)")
     resp, _ = _run([_assistant(LIMIT, "rate_limit"), _result()])
     check("still classified as a failure", resp.startswith("FLUSH_ERROR:"))
-    check("the error text is not returned as summary content", not resp.startswith("You've"))
+    check("the error text is returned only inside the failure marker",
+          resp.startswith("FLUSH_ERROR: API rate_limit:") and resp.count("hit your limit") == 1)
+
+    print("\na run whose END RESULT is an error, exit 0, no flagged message (/code-review finding)")
+    resp, _ = _run([_assistant("**Context:** half a summ"), _result("error_max_turns", True)])
+    check("error_max_turns is a failure, its partial text is not saved", resp.startswith("FLUSH_ERROR:") and "error_max_turns" in resp)
+    resp, _ = _run([_assistant("**Context:** x"), _result("success", True)])
+    check("is_error=True with subtype 'success' is still a failure", resp.startswith("FLUSH_ERROR:"))
 
     print("\nmodel too new for the bundled CLI (79 of 351)")
     msg = "API Error: 400 Claude Code 2.1.131 does not support this model; version 2.1.251 or newer is required."

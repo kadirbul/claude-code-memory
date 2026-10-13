@@ -20,6 +20,7 @@ import json
 import logging
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -133,8 +134,6 @@ respond with exactly: FLUSH_OK
 
 {context}"""
 
-    from collections import deque
-
     response = ""
     # WHY these two (WI-bugfix-4d7e21 part 2): the CLI's failure used to surface only as
     # "Command failed with exit code 1 ... Check stderr output for details", with the
@@ -167,7 +166,11 @@ respond with exactly: FLUSH_OK
                     continue
                 response += text
             elif isinstance(message, ResultMessage):
-                pass
+                # The end-of-run verdict, same test as compile.py: error_max_turns /
+                # error_during_execution can exit 0 with no `error` on any message, and
+                # their partial text must not be saved as a finished summary.
+                if (message.is_error or message.subtype != "success") and not api_error:
+                    api_error = f"result {message.subtype}: {(message.result or '').strip()}"
     except Exception as e:
         import traceback
         logging.error("Agent SDK error: %s\n%s", e, traceback.format_exc())
