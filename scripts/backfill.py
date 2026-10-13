@@ -424,6 +424,9 @@ def main() -> None:
         total_fail += fail
 
     print(f"\nDone. chunks_flushed={total_ok} chunks_failed={total_fail}", flush=True)
+    if total_fail:
+        # Non-zero so run_flush.bat and the scheduled task cannot report a false green.
+        sys.exit(1)
     print(f"Daily logs: {DAILY_DIR}", flush=True)
 
 

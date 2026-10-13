@@ -125,6 +125,7 @@ def main() -> int:
         rc, calls, out = _run(succeed=True)
         check("only the parseable file tried", [c[0] for c in calls] == [_name(1)])
         check("odd file still there", (d / "backfill-nodate.md").exists())
+        check("odd file not counted as waiting", "1 saved, 0 failed, 0 set aside, 0 still waiting" in out)
 
     print(f"\n{'ALL PASS' if not FAILURES else f'{len(FAILURES)} FAILED: {FAILURES}'}")
     return 1 if FAILURES else 0

@@ -59,14 +59,19 @@ def parse_name(name: str) -> tuple[str, str] | None:
     return m["sid"], f"{s[:4]}-{s[4:6]}-{s[6:]}"
 
 
-def preserved_captures(now: float) -> list[Path]:
-    """Kept captures old enough to retry, oldest first."""
-    files = [
-        p for pattern in ("backfill-*.md", "session-flush-*.md", "flush-context-*.md")
-        for p in SCRIPTS_DIR.glob(pattern)
-        if now - p.stat().st_mtime >= MIN_AGE_S
-    ]
-    return sorted(files, key=lambda p: p.stat().st_mtime)
+def preserved_captures() -> list[tuple[Path, float]]:
+    """Every kept capture with a recognised name, as (path, mtime), oldest first."""
+    found = []
+    for pattern in ("backfill-*.md", "session-flush-*.md", "flush-context-*.md"):
+        for p in SCRIPTS_DIR.glob(pattern):
+            if parse_name(p.name) is None:
+                print(f"  SKIP {p.name}: name not recognised, left alone", flush=True)
+                continue
+            try:
+                found.append((p, p.stat().st_mtime))
+            except FileNotFoundError:
+                continue  # a live flush finished and removed it between glob and stat
+    return sorted(found, key=lambda pm: pm[1])
 
 
 def _load_attempts() -> dict:
@@ -80,14 +85,14 @@ def main() -> int:
     attempts = _load_attempts()
     saved = failed = set_aside = 0
     tried = 0
-    for capture in preserved_captures(time.time()):
+    captures = preserved_captures()
+    now = time.time()
+    for capture, mtime in captures:
         if tried >= MAX_PER_RUN:
             break
-        parsed = parse_name(capture.name)
-        if parsed is None:
-            print(f"  SKIP {capture.name}: name not recognised, left alone", flush=True)
+        if now - mtime < MIN_AGE_S:
             continue
-        session_id, target_date = parsed
+        session_id, target_date = parse_name(capture.name)  # type: ignore[misc]
         tried += 1
         print(f"  RETRY {capture.name}", flush=True)
         if backfill.invoke_flush(capture, session_id, target_date):
@@ -107,7 +112,7 @@ def main() -> int:
     # Drop counts for files that are gone (saved by hand, or deleted) so the file cannot grow.
     attempts = {k: v for k, v in attempts.items() if (SCRIPTS_DIR / k).exists()}
     ATTEMPTS_FILE.write_text(json.dumps(attempts, indent=1), encoding="utf-8")
-    waiting = len(preserved_captures(float("inf")))
+    waiting = len(captures) - saved - set_aside
     print(
         f"retry-preserved: {saved} saved, {failed} failed, {set_aside} set aside, "
         f"{waiting} still waiting", flush=True,
