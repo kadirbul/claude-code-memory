@@ -133,7 +133,17 @@ respond with exactly: FLUSH_OK
 
 {context}"""
 
+    from collections import deque
+
     response = ""
+    # WHY these two (WI-bugfix-4d7e21 part 2): the CLI's failure used to surface only as
+    # "Command failed with exit code 1 ... Check stderr output for details", with the
+    # detail discarded, so two fixes were guesses. The real reason arrives as an
+    # AssistantMessage the SDK flags with `error` ("You've hit your limit", "Claude Code
+    # 2.1.131 does not support this model") - 350 of 351 failures 09-14..10-13 were one
+    # of those - and the CLI's own stderr is only piped when a callback is registered.
+    api_error = ""
+    stderr_tail: deque[str] = deque(maxlen=20)
 
     try:
         async for message in query(
@@ -145,18 +155,28 @@ respond with exactly: FLUSH_OK
                 # Pinned: unset inherited the account default (Opus) for a
                 # 2-turn summarisation that Haiku handles fine.
                 model="claude-haiku-4-5-20251001",
+                stderr=stderr_tail.append,
             ),
         ):
             if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        response += block.text
+                text = "".join(b.text for b in message.content if isinstance(b, TextBlock))
+                if message.error:
+                    # Never summary text: an exit-0 run would otherwise save it to the
+                    # daily log as knowledge (it did - 2026-05-07, 2026-06-25).
+                    api_error = f"{message.error}: {text.strip()}"
+                    continue
+                response += text
             elif isinstance(message, ResultMessage):
                 pass
     except Exception as e:
         import traceback
         logging.error("Agent SDK error: %s\n%s", e, traceback.format_exc())
         response = f"FLUSH_ERROR: {type(e).__name__}: {e}"
+
+    if api_error:
+        response = f"FLUSH_ERROR: API {api_error}"
+    if response.startswith("FLUSH_ERROR:") and stderr_tail:
+        logging.error("CLI stderr (last %d lines):\n%s", len(stderr_tail), "\n".join(stderr_tail))
 
     return response
 
