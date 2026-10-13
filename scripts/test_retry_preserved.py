@@ -127,6 +127,42 @@ def main() -> int:
         check("odd file still there", (d / "backfill-nodate.md").exists())
         check("odd file not counted as waiting", "1 saved, 0 failed, 0 set aside, 0 still waiting" in out)
 
+        print("a saved whole-day chunk moves aside the session's earlier captures of that day")
+        bf = rp.backfill
+        d = tmp / "superseded"
+        d.mkdir()
+        bf.SCRIPTS_DIR, bf.PRESERVED_FAILED_DIR = d, d / "preserved-failed"
+        src = d / f"{SID}.jsonl"
+        src.write_text("{}", encoding="utf-8")
+        files = {
+            f"session-flush-{SID}-20261013-140000.md": 6 * HOUR,   # earlier, same day -> moved
+            f"backfill-{SID}-2026-10-13-20261013-120000.md": 7 * HOUR,  # earlier backfill -> moved
+            f"flush-context-{SID}-20261012-140000.md": 30 * HOUR,  # other day -> stays
+            "session-flush-other-sess-20261013-140000.md": 6 * HOUR,  # other session -> stays
+            f"session-flush-{SID}-20261013-195959.md": -60,        # newer than transcript -> stays
+        }
+        for name, age in files.items():
+            (d / name).write_text("x", encoding="utf-8")
+            t = time.time() - age
+            os.utime(d / name, (t, t))
+        os.utime(src, (time.time() - HOUR, time.time() - HOUR))
+
+        bf.invoke_flush = lambda f, s, dt: False
+        with contextlib.redirect_stdout(io.StringIO()):
+            bf.run_flush_for_chunk(SID, "2026-10-13", "ctx", 3, "t", src)
+        check("failed chunk moves nothing", not (d / "preserved-failed").exists())
+
+        def _ok(f: Path, s: str, dt: str) -> bool:
+            f.unlink()
+            return True
+        bf.invoke_flush = _ok
+        with contextlib.redirect_stdout(io.StringIO()):
+            bf.run_flush_for_chunk(SID, "2026-10-13", "ctx", 3, "t", src)
+        moved = sorted(p.name for p in (d / "preserved-failed").glob("*.md"))
+        check("earlier same-day captures moved", moved == sorted(list(files)[:2]))
+        check("other day, other session, newer capture all stay",
+              all((d / n).exists() for n in list(files)[2:]))
+
     print(f"\n{'ALL PASS' if not FAILURES else f'{len(FAILURES)} FAILED: {FAILURES}'}")
     return 1 if FAILURES else 0
 

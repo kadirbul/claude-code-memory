@@ -34,7 +34,7 @@ import backfill  # noqa: E402
 
 SCRIPTS_DIR = backfill.SCRIPTS_DIR
 ATTEMPTS_FILE = SCRIPTS_DIR / "preserved-retries.json"
-FAILED_DIR = SCRIPTS_DIR / "preserved-failed"
+FAILED_DIR = backfill.PRESERVED_FAILED_DIR
 MAX_PER_RUN = 10
 MAX_ATTEMPTS = 3
 MIN_AGE_S = 3600

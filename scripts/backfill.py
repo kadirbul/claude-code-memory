@@ -38,6 +38,8 @@ SCRIPTS_DIR = ROOT / "scripts"
 DAILY_DIR = ROOT / "daily"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 STATE_FILE = SCRIPTS_DIR / "last-flush.json"
+# Kept captures that are no longer retried: failed too often, or superseded (WI-bugfix-1b9f04)
+PRESERVED_FAILED_DIR = SCRIPTS_DIR / "preserved-failed"
 
 # Resolve uv.exe by checking the well-known install location first, then PATH.
 # subprocess.Popen on Windows does NOT search PATH for unqualified names the
@@ -259,7 +261,8 @@ def run_flush_for_chunk(
 ) -> bool:
     """Run flush.py for one (session, date) chunk. Returns True on success."""
     # Write context md, same naming convention session-end.py uses but with date
-    timestamp = datetime.fromtimestamp(source_jsonl.stat().st_mtime).astimezone().strftime("%Y%m%d-%H%M%S")
+    source_mtime = source_jsonl.stat().st_mtime
+    timestamp = datetime.fromtimestamp(source_mtime).astimezone().strftime("%Y%m%d-%H%M%S")
     context_file = SCRIPTS_DIR / f"backfill-{session_id}-{target_date}-{timestamp}.md"
     header = (
         f"<!-- backfill: {source_jsonl.name} | date={target_date} | "
@@ -271,7 +274,38 @@ def run_flush_for_chunk(
         f"  RUN  {session_id[:8]} [{target_date}]: {turn_count} turns, "
         f"{len(context):,} chars \u2014 {title[:60]}", flush=True,
     )
-    return invoke_flush(context_file, session_id, target_date)
+    if not invoke_flush(context_file, session_id, target_date):
+        return False
+    set_aside_superseded(session_id, target_date, source_mtime)
+    return True
+
+
+def set_aside_superseded(session_id: str, target_date: str, source_mtime: float) -> None:
+    """Move kept captures of this session+date that the chunk just saved already contains.
+
+    A failed flush keeps its capture for retry_preserved.py. Once this whole-day chunk is
+    saved, retrying an earlier capture of the same session and day would write a second,
+    overlapping summary into that day's log (WI-bugfix-1b9f04, owner decision 2026-10-13).
+    Only captures written BEFORE the transcript we extracted from are moved - a later one
+    may hold turns this chunk does not. Moved to preserved-failed/, never deleted: a
+    session-end capture can carry a few turns from the previous day.
+    """
+    compact = target_date.replace("-", "")
+    patterns = (
+        f"session-flush-{session_id}-{compact}-*.md",
+        f"flush-context-{session_id}-{compact}-*.md",
+        f"backfill-{session_id}-{target_date}-*.md",
+    )
+    for pattern in patterns:
+        for p in SCRIPTS_DIR.glob(pattern):
+            try:
+                if p.stat().st_mtime >= source_mtime:
+                    continue
+                PRESERVED_FAILED_DIR.mkdir(exist_ok=True)
+                p.replace(PRESERVED_FAILED_DIR / p.name)
+            except OSError:
+                continue  # gone already, or held open by a live flush - retry handles it
+            print(f"  SUPERSEDED {p.name}: moved to preserved-failed/", flush=True)
 
 
 def invoke_flush(context_file: Path, session_id: str, target_date: str) -> bool:
