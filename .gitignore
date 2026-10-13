@@ -15,6 +15,8 @@ scripts/pkb_freshness.json
 scripts/scheduled_flush.log
 scripts/scheduled_compile.log
 scripts/backfill-*.md
+scripts/preserved-retries.json
+scripts/preserved-failed/
 
 # Generated content (built up per-user by hooks and scripts)
 daily/

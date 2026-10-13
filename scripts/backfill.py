@@ -267,7 +267,21 @@ def run_flush_for_chunk(
     )
     context_file.write_text(header + context, encoding="utf-8")
 
-    # Each (session, date) chunk needs its own dedup-bypass
+    print(
+        f"  RUN  {session_id[:8]} [{target_date}]: {turn_count} turns, "
+        f"{len(context):,} chars \u2014 {title[:60]}", flush=True,
+    )
+    return invoke_flush(context_file, session_id, target_date)
+
+
+def invoke_flush(context_file: Path, session_id: str, target_date: str) -> bool:
+    """Run flush.py synchronously on an existing context file. Returns True on success.
+
+    Shared with retry_preserved.py (WI-bugfix-1b9f04), which re-flushes captures that an
+    earlier failed flush left on disk.
+    """
+    # Each (session, date) chunk needs its own dedup-bypass. For a retried capture this is
+    # not optional: flush.py DELETES its input when the session flushed in the last 30 min.
     clear_dedup_for(session_id)
 
     flush_script = SCRIPTS_DIR / "flush.py"
@@ -282,10 +296,6 @@ def run_flush_for_chunk(
 
     creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-    print(
-        f"  RUN  {session_id[:8]} [{target_date}]: {turn_count} turns, "
-        f"{len(context):,} chars \u2014 {title[:60]}", flush=True,
-    )
     t0 = time.time()
     try:
         result = subprocess.run(

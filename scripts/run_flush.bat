@@ -27,4 +27,10 @@ echo ===== %DATE% %TIME% — flush for %TODAY% ===== >> "%LOG_FILE%"
 "%UV_BIN%\uv.exe" run --directory "%PROJECT_DIR%" python "%PROJECT_DIR%\scripts\backfill.py" --since %TODAY% >> "%LOG_FILE%" 2>&1
 set "EXIT_CODE=%ERRORLEVEL%"
 echo [exit=%EXIT_CODE%] %DATE% %TIME% >> "%LOG_FILE%"
+
+REM Then retry captures an earlier failed flush kept on disk (WI-bugfix-1b9f04).
+"%UV_BIN%\uv.exe" run --directory "%PROJECT_DIR%" python "%PROJECT_DIR%\scripts\retry_preserved.py" >> "%LOG_FILE%" 2>&1
+set "RETRY_EXIT=%ERRORLEVEL%"
+echo [retry exit=%RETRY_EXIT%] %DATE% %TIME% >> "%LOG_FILE%"
+if not "%RETRY_EXIT%"=="0" if "%EXIT_CODE%"=="0" set "EXIT_CODE=%RETRY_EXIT%"
 exit /b %EXIT_CODE%

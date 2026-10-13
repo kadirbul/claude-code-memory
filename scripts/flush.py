@@ -253,9 +253,8 @@ def main():
         #
         # Returning leaves the capture on disk and the session unrecorded, and skips
         # maybe_trigger_compilation(), which is right - nothing new was compiled.
-        # NOTE, deliberately not overstated: nothing re-reads a preserved file today. All
-        # three producers mint a NEW timestamped context file, so there is no retry
-        # consumer and these are manual-recovery material (WI-bugfix-1b9f04).
+        # All three producers mint a NEW timestamped context file, so this one is retried by
+        # retry_preserved.py from the nightly run_flush.bat (WI-bugfix-1b9f04).
         # Exits NON-ZERO so backfill.py and run_flush.bat cannot report a false green.
         logging.error("Result: %s", response)
         logging.error("PRESERVED, not recorded and nothing appended: %s", context_file)
