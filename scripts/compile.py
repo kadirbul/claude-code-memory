@@ -311,9 +311,20 @@ Read the daily log above and compile it into wiki articles following the schema 
                 allowed_tools=["Read", "Write", "Edit", "Glob", "Grep"],
                 permission_mode="acceptEdits",
                 max_turns=30,
+                # WHY (WI-bugfix-e78c0f): scheduled runs died with NO output at all, and
+                # the CLI's stderr is only piped when a callback is registered. Printed as
+                # it arrives, not as a tail at the end like flush.py, because a run killed
+                # mid-flight never reaches an end; run_compile.bat sets PYTHONUNBUFFERED so
+                # these lines survive that kill.
+                stderr=lambda line: print(f"  [cli] {line}"),
             ),
         ):
             if isinstance(message, AssistantMessage):
+                if message.error:
+                    # The real reason for an opaque exit-1 arrives here (WI-bugfix-4d7e21
+                    # found usage-limit and CLI-too-old this way). Logged only; the
+                    # ResultMessage check below still decides what is recorded.
+                    print(f"  API error ({message.error})")
                 for block in message.content:
                     if isinstance(block, TextBlock):
                         pass  # compilation output - LLM writes files directly

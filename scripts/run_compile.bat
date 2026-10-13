@@ -17,6 +17,9 @@ set "PROJECT_DIR=C:\claude-code\claude-code-memory"
 set "LOG_FILE=%PROJECT_DIR%\scripts\scheduled_compile.log"
 
 set "PATH=%UV_BIN%;C:\Windows\System32;C:\Windows;%PATH%"
+REM Unbuffered: a killed run otherwise loses every line still in Python's buffer, which
+REM is why several 2026-10 failures logged nothing but [exit=1] (WI-bugfix-e78c0f).
+set "PYTHONUNBUFFERED=1"
 
 cd /d "%PROJECT_DIR%"
 echo. >> "%LOG_FILE%"
