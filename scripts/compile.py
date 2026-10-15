@@ -15,8 +15,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import faulthandler
 import os
+import signal
 import sys
+import time
 from pathlib import Path
 
 from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, DAILY_DIR, KNOWLEDGE_DIR, now_iso
@@ -389,7 +392,42 @@ def report_duplicates() -> None:
         print(f"  {overlap:.2f}  {name_a}  <->  {name_b}")
 
 
+def stamp() -> str:
+    return time.strftime("%H:%M:%S")
+
+
+def report_deaths() -> None:
+    """Make every death this process CAN see leave a line in the log.
+
+    WHY (WI-bugfix-e78c0f): the 2026-10-13 22:00 run died mid-file with [exit=1] and
+    nothing else, even with the CLI's stderr logged. `taskkill /F` reproduces exactly
+    that (rc=1, no output): a hard kill runs no handler at all, and neither does
+    SIGKILL on Linux. What this adds is the deaths that DO announce themselves - a
+    stop/hang-up signal (SIGTERM/SIGHUP from cron, systemd or a container stop on
+    Linux and cloud hosts; SIGBREAK on Windows) and a hard crash (faulthandler). So
+    the next silent death narrows to "killed from outside"; a death with a line names
+    the signal.
+
+    Line-buffered here, not only via run_compile.bat's PYTHONUNBUFFERED: a Linux
+    cron/systemd job has no such wrapper, and a hard kill discards whatever is still
+    buffered - exactly the lines that would place the death.
+    """
+    sys.stdout.reconfigure(line_buffering=True)
+    faulthandler.enable()
+
+    def on_signal(signum, _frame):
+        print(f"  [signal {signal.Signals(signum).name} at {stamp()}] exiting")
+        sys.exit(128 + signum)
+
+    for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
+        sig = getattr(signal, name, None)  # SIGHUP is POSIX-only, SIGBREAK Windows-only
+        if sig is not None:
+            signal.signal(sig, on_signal)
+    print(f"[run pid={os.getpid()} started {stamp()}]")
+
+
 def main():
+    report_deaths()
     parser = argparse.ArgumentParser(description="Compile daily logs into knowledge articles")
     parser.add_argument("--all", action="store_true", help="Force recompile all logs")
     parser.add_argument("--file", type=str, help="Compile a specific daily log file")
@@ -438,12 +476,12 @@ def main():
     # Compile each file sequentially
     total_cost = 0.0
     for i, log_path in enumerate(to_compile, 1):
-        print(f"\n[{i}/{len(to_compile)}] Compiling {log_path.name}...")
+        print(f"\n[{i}/{len(to_compile)}] {stamp()} Compiling {log_path.name}...")
         cost = asyncio.run(
             compile_daily_log(log_path, state, force=bool(args.all or args.file))
         )
         total_cost += cost
-        print(f"  Done.")
+        print(f"  Done. ({stamp()})")
 
     articles = list_wiki_articles()
     print(f"\nCompilation complete. Total cost: ${total_cost:.2f}")
