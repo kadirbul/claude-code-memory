@@ -32,6 +32,7 @@ from utils import (
     near_duplicate_pairs,
     read_wiki_index,
     save_state,
+    select_related,
 )
 
 # Mark every nested Claude session this script starts as machine-invoked, BEFORE the
@@ -116,46 +117,12 @@ def state_entry(raw: bytes, cost: float) -> dict:
     }
 
 
-async def compile_daily_log(log_path: Path, state: dict, force: bool = False) -> float:
-    """Compile a single daily log into knowledge articles.
+def build_prompt(log_path: Path, log_content: str, increment_note: str) -> tuple[str, int, int]:
+    """The compile prompt for one log; returns (prompt, articles sent, articles in the wiki).
 
-    Returns the API cost of the compilation.
+    Separate from compile_daily_log() so its size can be measured without an LLM call.
     """
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        ResultMessage,
-        TextBlock,
-        query,
-    )
-
-    raw_bytes = log_path.read_bytes()
-    # `--all` and `--file` are the documented recovery levers ("Force recompile all
-    # logs"), so they must mean the WHOLE log, not the tail. Discarding prev_entry is
-    # what makes select_log_content fall back to a full compile; without this, a
-    # rebuild after the wiki is damaged would silently send only appended text and
-    # report success (found in review of d921e51).
-    prev_entry = {} if force else ((state.get("ingested") or {}).get(log_path.name) or {})
-    log_content, is_increment = select_log_content(raw_bytes, prev_entry)
-    # The note must also OVERRIDE rule 1's "3-7 concepts" floor. An increment can be a
-    # few hundred characters, and a floor applied to it forces the agent to pad one
-    # throwaway remark into three articles - each a reworded facet of something the
-    # earlier full compile already wrote. That would manufacture exactly the
-    # near-duplicates this change exists to prevent (found in review of d921e51).
-    increment_note = (
-        "  **INCREMENT** - this day was already compiled. What follows is ONLY the text"
-        " appended since. Everything before it ALREADY HAS ARTICLES: update those, never"
-        " re-create them under a new title. **This OVERRIDES the 3-7 concept count in"
-        " rule 1: for an increment the right number is 0-3, and ZERO IS A CORRECT AND"
-        " COMMON ANSWER.** A short tail usually warrants updating one existing article"
-        " and nothing else. Do not invent articles to reach a quota; if the appended"
-        " text adds no new concept, update what exists, note that in knowledge/log.md,"
-        " and stop."
-        if is_increment
-        else ""
-    )
     schema = AGENTS_FILE.read_text(encoding="utf-8")
-    wiki_index = read_wiki_index()
 
     # List existing articles by PATH ONLY - never inline their contents.
     #
@@ -168,12 +135,30 @@ async def compile_daily_log(log_path: Path, state: dict, force: bool = False) ->
     #
     # The agent has Read/Grep/Glob, so it opens the handful of articles a given log
     # actually touches instead of receiving all of them.
-    article_paths = [str(p.relative_to(KNOWLEDGE_DIR)) for p in list_wiki_articles()]
-    existing_articles_context = (
-        "\n".join(f"- {rel}" for rel in article_paths)
-        if article_paths
-        else "(No existing articles yet)"
+    #
+    # The same now applies to the index rows and the path LIST themselves
+    # (WI-bugfix-9fbb94): only the related ones are sent - see select_related().
+    # as_posix() so the paths match the index's `[[concepts/slug]]` rows on every OS.
+    all_paths = [p.relative_to(KNOWLEDGE_DIR).as_posix() for p in list_wiki_articles()]
+    index_rows, related = select_related(
+        log_content, read_wiki_index(), all_paths, source_name=log_path.name
     )
+    if related:
+        related_context = (
+            f"These are {len(related)} of the wiki's {len(all_paths)} articles: those already"
+            f" compiled from {log_path.name}, then those whose NAMES share the most distinctive"
+            " words with this log. It is a pre-selected SUBSET, not the whole wiki.\n\n"
+            "### Their index rows\n\n"
+            + ("\n".join(index_rows) if index_rows
+               else "(None of these articles has a row in index.md yet.)")
+            + "\n\n### Their paths (relative to `knowledge/`)\n\n"
+            + "\n".join(f"- {rel}" for rel in related)
+        )
+    else:
+        related_context = (
+            f"None of the wiki's {len(all_paths)} articles share a distinctive word with this"
+            " log. That does NOT mean the topic is new - search before creating anything."
+        )
 
     timestamp = now_iso()
 
@@ -198,17 +183,18 @@ and extract knowledge into structured wiki articles.
 
 {schema}
 
-## Current Wiki Index
+## Related Wiki Articles
 
-{wiki_index}
-
-## Existing Wiki Articles (paths only, relative to `knowledge/`)
-
-{existing_articles_context}
+{related_context}
 
 Their contents are deliberately NOT included here. Before you update or link to any
 article, open it with the Read tool. Use Grep to find which articles already mention
 a concept. Only read the articles this daily log actually touches - do not read them all.
+
+**Do NOT Read `knowledge/index.md` in full**, although the schema's compile steps say to
+read it first: the related rows above replace that step, and the whole index (500+ rows)
+would be re-sent on every later turn. To add your rows, Read only its first 10 lines and
+insert below the table header; to check one article's row, Grep the index for its slug.
 
 ## Daily Log to Compile
 
@@ -231,8 +217,10 @@ Read the daily log above and compile it into wiki articles following the schema 
    pass is the LARGEST source of duplication in this wiki, and searching cannot catch
    it, because neither article exists yet at the moment you plan them both.
 
-2. **For EACH concept, SEARCH BEFORE YOU WRITE.** Grep `knowledge/concepts/` for the
-   concept's distinctive words, and scan the article-path list above. Search for
+2. **For EACH concept, SEARCH BEFORE YOU WRITE.** Grep `knowledge/concepts/`,
+   `knowledge/connections/`, `knowledge/projects/` and `knowledge/qa/` (not index.md or
+   log.md) for the concept's distinctive words, and scan the related paths above - they
+   are a SUBSET picked by name, so the Grep is what finds the rest. Search for
    REORDERED and SYNONYMOUS forms of the title, not just the exact slug you have in
    mind - the same topic has repeatedly been filed twice under permuted names, e.g.
    `ssrf-unvalidated-urlopen-scheme` alongside `urlopen-ssrf-unvalidated-scheme`.
@@ -275,6 +263,51 @@ Read the daily log above and compile it into wiki articles following the schema 
 - Related Concepts section should have 2+ entries
 - Sources section should cite the daily log with specific claims extracted
 """
+    return prompt, len(related), len(all_paths)
+
+
+async def compile_daily_log(log_path: Path, state: dict, force: bool = False) -> float:
+    """Compile a single daily log into knowledge articles.
+
+    Returns the API cost of the compilation.
+    """
+    from claude_agent_sdk import (
+        AssistantMessage,
+        ClaudeAgentOptions,
+        ResultMessage,
+        TextBlock,
+        query,
+    )
+
+    raw_bytes = log_path.read_bytes()
+    # `--all` and `--file` are the documented recovery levers ("Force recompile all
+    # logs"), so they must mean the WHOLE log, not the tail. Discarding prev_entry is
+    # what makes select_log_content fall back to a full compile; without this, a
+    # rebuild after the wiki is damaged would silently send only appended text and
+    # report success (found in review of d921e51).
+    prev_entry = {} if force else ((state.get("ingested") or {}).get(log_path.name) or {})
+    log_content, is_increment = select_log_content(raw_bytes, prev_entry)
+    # The note must also OVERRIDE rule 1's "3-7 concepts" floor. An increment can be a
+    # few hundred characters, and a floor applied to it forces the agent to pad one
+    # throwaway remark into three articles - each a reworded facet of something the
+    # earlier full compile already wrote. That would manufacture exactly the
+    # near-duplicates this change exists to prevent (found in review of d921e51).
+    increment_note = (
+        "  **INCREMENT** - this day was already compiled. What follows is ONLY the text"
+        " appended since. Everything before it ALREADY HAS ARTICLES: update those, never"
+        " re-create them under a new title. **This OVERRIDES the 3-7 concept count in"
+        " rule 1: for an increment the right number is 0-3, and ZERO IS A CORRECT AND"
+        " COMMON ANSWER.** A short tail usually warrants updating one existing article"
+        " and nothing else. Do not invent articles to reach a quota; if the appended"
+        " text adds no new concept, update what exists, note that in knowledge/log.md,"
+        " and stop."
+        if is_increment
+        else ""
+    )
+    prompt, n_sent, n_total = build_prompt(log_path, log_content, increment_note)
+    # The deterministic half of WI-bugfix-9fbb94's check: cost per run swings with
+    # turn count (one log ran 3-69 turns), the prompt size does not.
+    print(f"  Prompt: {n_sent} of {n_total} articles, {len(prompt):,} chars")
 
     cost = 0.0
     incomplete = False

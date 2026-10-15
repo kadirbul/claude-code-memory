@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from compile import select_log_content, state_entry  # noqa: E402
-from utils import duplicate_pairs_among, hash_bytes, near_duplicate_pairs  # noqa: E402
+from utils import duplicate_pairs_among, hash_bytes, near_duplicate_pairs, select_related  # noqa: E402
 
 failures: list[str] = []
 
@@ -127,6 +127,57 @@ check("threshold is honoured - raising it past the score drops the pair",
       duplicate_pairs_among(["concepts/one-knowledge-plane-program.md",
                              "concepts/one-knowledge-plane-program-ini-018.md"],
                             threshold=0.95), [])
+
+print("\nselect_related - only the related index rows and paths reach the prompt (WI-bugfix-9fbb94)")
+paths = [
+    "concepts/pm2-resurrect-ships-working-tree.md",
+    "concepts/vault-secret-rotation-policy.md",          # control: unrelated to the log
+    "concepts/pm2-cluster-mode.md",                      # one word shared, ranks lower
+]
+index = "\n".join([
+    "| Article | Summary | Compiled From | Updated |",
+    "|---|---|---|---|",
+    "| [[concepts/pm2-resurrect-ships-working-tree]] | NEWEST row | d2 | 2026-10-02 |",
+    "| [[concepts/vault-secret-rotation-policy]] | vault row | d1 | 2026-10-01 |",
+    "| [[concepts/pm2-resurrect-ships-working-tree]] | older row | d1 | 2026-10-01 |",
+    "| [[concepts/pm2-cluster-mode]] | cluster row | d1 | 2026-10-01 |",
+])
+log = "After the restart, pm2 resurrect shipped the working tree, not a snapshot."
+rows, chosen = select_related(log, index, paths)
+check("the best match ranks first, the one-word match second, the control not at all",
+      chosen, ["concepts/pm2-resurrect-ships-working-tree.md", "concepts/pm2-cluster-mode.md"])
+check("rows = table header, then each chosen article's NEWEST row only",
+      rows, [index.splitlines()[0], index.splitlines()[1], index.splitlines()[2], index.splitlines()[5]])
+check("limit is honoured", select_related(log, index, paths, limit=1)[1],
+      ["concepts/pm2-resurrect-ships-working-tree.md"])
+check("a log sharing no word with any name selects nothing (and sends no bare header)",
+      select_related("zebra quokka", index, paths), ([], []))
+check("stopwords alone never select an article",
+      select_related("the and for with", index, ["concepts/the-and-for-with-x.md"]), ([], []))
+
+# The cases the 2026-10-15 review found the first version getting wrong.
+reordered = "\n".join([
+    "| Article | Summary | Compiled From | Updated |",
+    "|---|---|---|---|",
+    "| [[concepts/pm2-cluster-mode]] | OLD summary | daily/2026-09-01.md | 2026-09-01 |",
+    "| [[concepts/pm2-cluster-mode]] | NEW summary | daily/2026-10-14.md | 2026-10-14 |",
+])
+check("the newest row is chosen by its DATE, not by being first (the index is not always prepended)",
+      select_related("pm2 cluster", reordered, ["concepts/pm2-cluster-mode.md"])[0][2:],
+      [reordered.splitlines()[3]])
+check("an INCREMENT tail sharing no word still gets the articles compiled from the same day",
+      select_related("zebra quokka", reordered, ["concepts/pm2-cluster-mode.md"],
+                     source_name="2026-10-14.md")[1],
+      ["concepts/pm2-cluster-mode.md"])
+common = [f"concepts/session-commit-fix-update-{i}-note.md" for i in range(20)]
+check("a rare exact name outranks long names made of common words (IDF, not raw hits)",
+      select_related("session commit fix update note about resurrect", "",
+                     common + ["concepts/resurrect.md"], limit=1)[1],
+      ["concepts/resurrect.md"])
+check("one tokenizer for log and name: a dotted, mixed-case name is still found",
+      select_related("Upgraded NextJS to v14.2 today", "",
+                     ["concepts/NextJS-v14.2-build.md", "concepts/vault-secret-rotation-policy.md"])[1],
+      ["concepts/NextJS-v14.2-build.md"])
 
 # Reported, never asserted - the live corpus is machine-specific and is meant to shrink.
 print(f"\n  INFO  live corpus currently reports {len(near_duplicate_pairs())} near-duplicate pairs")

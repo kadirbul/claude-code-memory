@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import re
 from pathlib import Path
 
@@ -162,6 +163,88 @@ def near_duplicate_pairs(threshold: float = 0.5) -> list[tuple[str, str, float]]
         [p.relative_to(KNOWLEDGE_DIR).as_posix() for p in list_wiki_articles()],
         threshold,
     )
+
+
+# Words too common to say anything about which article a log is related to. The IDF
+# weighting in select_related() already discounts frequent NAME words; this list only
+# drops glue words that are rare in names but everywhere in prose.
+_SELECT_STOPWORDS = {"the", "and", "for", "with", "not", "from", "that", "this", "when", "into"}
+
+
+def _select_words(text: str) -> set[str]:
+    """Lowercase alphanumeric words longer than 2 chars, minus glue words.
+
+    ONE tokenizer for both sides - the log's prose and an article's name - so a name
+    like `nextjs-v14.2-build` can match the log that mentions it. Deliberately NOT the
+    tokenizer duplicate_pairs_among() uses: that one defines the near-duplicate trend
+    WI-bugfix-3cdd9f is measured against, and must not move with this change.
+    """
+    return {w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) > 2} - _SELECT_STOPWORDS
+
+
+def select_related(
+    log_text: str, index_text: str, paths: list[str], limit: int = 50, source_name: str = ""
+) -> tuple[list[str], list[str]]:
+    """Pick the articles a daily log is most likely about, without an LLM.
+
+    WHY (WI-bugfix-9fbb94): the compile prompt used to carry the WHOLE index.md (510
+    rows, ~138K chars) and every article path (677, ~35K chars), re-read on every
+    turn - a fixed ~95K-token floor, so a 150-byte log cost about what a big one did
+    and the floor grew with the wiki. Owner decision 2026-10-13 (option A): send only
+    the rows and paths of the related articles. A list stays in the prompt because the
+    search-before-write rule tells the agent to scan it; the prompt says it is a subset.
+
+    Selection, in order:
+    1. Every article whose index row names `source_name` in "Compiled From" - on an
+       INCREMENT the log text is only the appended tail, but the prompt tells the agent
+       to update what the earlier part of the same day already wrote, so those
+       articles must be on the list whatever words the tail happens to use.
+    2. Then by name-word overlap with the log, each word weighted by IDF across all
+       article names: a word in hundreds of names ("session", "fix") barely counts,
+       a rare one ("resurrect") dominates. Raw hit counts let long names full of
+       common words crowd out short exact matches. Ties: larger share of the name
+       matched, then path.
+
+    Returns (index rows, paths), both in selection order. Rows are the table header
+    then each chosen article's NEWEST row by its Updated date - not its first row: the
+    live index is not consistently prepended (16 articles had a newer row further
+    down, 2026-10-15). Many articles have no row at all; rows is [] when none of the
+    chosen ones do. A log sharing no weighted word with any name selects nothing.
+    """
+    names = {path: _select_words(path.rsplit("/", 1)[-1].removesuffix(".md")) for path in paths}
+    df: dict[str, int] = {}
+    for words in names.values():
+        for w in words:
+            df[w] = df.get(w, 0) + 1
+    log_words = _select_words(log_text)
+
+    lines = index_text.splitlines()
+    header = [ln for ln in lines if ln.startswith("| Article ") or ln.startswith("|---")][:2]
+    newest_row: dict[str, tuple[str, str]] = {}
+    from_source: list[str] = []
+    for ln in lines:
+        m = re.match(r"\| \[\[([^\]]+)\]\]", ln)
+        if not m:
+            continue
+        cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+        slug, updated = m.group(1), (cells[-1] if len(cells) >= 4 else "")
+        if slug not in newest_row or updated > newest_row[slug][0]:
+            newest_row[slug] = (updated, ln)
+        if source_name and len(cells) >= 4 and source_name in cells[-2]:
+            from_source.append(slug)
+
+    pinned = list(dict.fromkeys(p for p in paths if p.removesuffix(".md") in set(from_source)))
+    scored = []
+    for path, words in names.items():
+        matched = words & log_words
+        if matched and path not in pinned:
+            weight = sum(math.log(len(paths) / df[w]) for w in matched)
+            scored.append((weight, len(matched) / len(words), path))
+    scored.sort(key=lambda t: (-t[0], -t[1], t[2]))
+    chosen = pinned + [path for _, _, path in scored[: max(0, limit - len(pinned))]]
+
+    rows = [newest_row[p.removesuffix(".md")][1] for p in chosen if p.removesuffix(".md") in newest_row]
+    return (header + rows if rows else []), chosen
 
 
 def duplicate_pairs_among(slugs: list[str], threshold: float = 0.5) -> list[tuple[str, str, float]]:
