@@ -34,9 +34,23 @@ def save_state(state: dict) -> None:
 
 # ── File hashing ──────────────────────────────────────────────────────
 
+def hash_bytes(b: bytes) -> str:
+    """SHA-256 of `b`, first 16 hex chars - the ONE digest every state hash uses.
+
+    WHY one helper (WI-bugfix-2c38be): compile.select_log_content() detects an
+    appended log by re-hashing a prefix and comparing it with the hash state_entry()
+    stored. When each site spelled the digest out itself, a change at one of them
+    meant the comparison never matched again - every log fell back to a full
+    recompile, silently, with tests still green. Changing THIS function still
+    invalidates every hash already in state.json (one full recompile of every log),
+    which is why test_compile_dedup.py pins its output.
+    """
+    return hashlib.sha256(b).hexdigest()[:16]
+
+
 def file_hash(path: Path) -> str:
     """SHA-256 hash of a file (first 16 hex chars)."""
-    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    return hash_bytes(path.read_bytes())
 
 
 # ── Slug / naming ─────────────────────────────────────────────────────

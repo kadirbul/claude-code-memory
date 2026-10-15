@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import os
 import sys
 from pathlib import Path
@@ -23,6 +22,7 @@ from pathlib import Path
 from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, DAILY_DIR, KNOWLEDGE_DIR, now_iso
 from utils import (
     file_hash,
+    hash_bytes,
     list_raw_files,
     list_wiki_articles,
     load_state,
@@ -83,7 +83,7 @@ def select_log_content(raw: bytes, prev: dict) -> tuple[str, bool]:
         isinstance(n, int)
         and prior_hash
         and 0 < n < len(raw)
-        and hashlib.sha256(raw[:n]).hexdigest()[:16] == prior_hash
+        and hash_bytes(raw[:n]) == prior_hash
     ):
         return raw[n:].decode("utf-8"), True
     return raw.decode("utf-8"), False
@@ -106,7 +106,7 @@ def state_entry(raw: bytes, cost: float) -> dict:
     failure this whole change must not introduce.
     """
     return {
-        "hash": hashlib.sha256(raw).hexdigest()[:16],
+        "hash": hash_bytes(raw),
         "compiled_bytes": len(raw),
         "compiled_at": now_iso(),
         "cost_usd": cost,

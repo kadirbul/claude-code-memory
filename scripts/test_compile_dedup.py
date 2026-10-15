@@ -10,14 +10,13 @@ corpus is only ever REPORTED here, never asserted on.
 """
 from __future__ import annotations
 
-import hashlib
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from compile import select_log_content, state_entry  # noqa: E402
-from utils import duplicate_pairs_among, near_duplicate_pairs  # noqa: E402
+from utils import duplicate_pairs_among, hash_bytes, near_duplicate_pairs  # noqa: E402
 
 failures: list[str] = []
 
@@ -31,8 +30,15 @@ def check(label: str, got, want) -> None:
 
 
 def h(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()[:16]
+    return hash_bytes(b)
 
+
+print("hash_bytes - pinned, because every state.json hash depends on it")
+# Every check below builds BOTH sides with the same helper, so a changed digest or
+# prefix length would leave them all green. What it really breaks is the hashes
+# already stored in state.json: none match, and every log recompiles in full. Only a
+# fixed value can catch that (WI-bugfix-2c38be). sha256(b"abc") is the FIPS 180-2 vector.
+check("hash_bytes(b'abc') is sha256, first 16 hex chars", hash_bytes(b"abc"), "ba7816bf8f01cfea")
 
 base = b"line one\nline two\n"
 tail = b"line three\n"
