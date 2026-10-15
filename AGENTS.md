@@ -332,7 +332,7 @@ Hooks are configured in `.claude/settings.json` and fire automatically when you 
 ```json
 {
   "hooks": {
-    "SessionStart": [{ "matcher": "", "hooks": [{ "type": "command", "command": "uv run python hooks/session-start.py", "timeout": 15 }] }],
+    "SessionStart": [{ "matcher": "", "hooks": [{ "type": "command", "command": "uv run python hooks/session-start.py --part log", "timeout": 15 }, { "type": "command", "command": "uv run python hooks/session-start.py --part index", "timeout": 15 }] }],
     "PreCompact": [{ "matcher": "", "hooks": [{ "type": "command", "command": "uv run python hooks/pre-compact.py", "timeout": 10 }] }],
     "SessionEnd": [{ "matcher": "", "hooks": [{ "type": "command", "command": "uv run python hooks/session-end.py", "timeout": 10 }] }]
   }
@@ -348,7 +348,8 @@ Commands use simple relative paths from the project root. Empty `matcher` catche
 - Reads `knowledge/index.md` and the most recent daily log
 - Outputs JSON to stdout: `{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "..."}}`
 - Claude sees the knowledge base index at the start of every session
-- Max context: 20,000 characters
+- Registered TWICE: `--part log` (date + recent log) and `--part index` (compacted index); missing or unknown `--part` fails loudly
+- Max context: 9,800 characters PER PART — Claude Code caps each hook's `additionalContext` at 10,000 and shows only a 2,000-char preview above that (WI-bugfix-3adda1)
 
 **`session-end.py`** (SessionEnd)
 - Reads hook input from stdin (JSON with `session_id`, `transcript_path`, `cwd`)

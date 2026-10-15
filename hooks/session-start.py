@@ -5,12 +5,17 @@ This is the "context injection" layer. When Claude Code starts a session,
 this hook reads the knowledge base index and recent daily log, then injects
 them as additional context so Claude always "remembers" what it has learned.
 
-Configure in .claude/settings.json:
+It runs as TWO hooks, one per part, because Claude Code caps each hook's
+additionalContext at 10,000 characters and replaces anything longer with a
+2,000-char preview (WI-bugfix-3adda1). Configure in .claude/settings.json:
 {
     "hooks": {
         "SessionStart": [{
             "matcher": "",
-            "command": "uv run python hooks/session-start.py"
+            "hooks": [
+                {"type": "command", "command": "uv run python hooks/session-start.py --part log"},
+                {"type": "command", "command": "uv run python hooks/session-start.py --part index"}
+            ]
         }]
     }
 }
@@ -27,7 +32,11 @@ KNOWLEDGE_DIR = ROOT / "knowledge"
 DAILY_DIR = ROOT / "daily"
 INDEX_FILE = KNOWLEDGE_DIR / "index.md"
 
-MAX_CONTEXT_CHARS = 20_000
+# Per PART, not per session: Claude Code measures each hook's additionalContext
+# on its own and caps it at 10,000 chars (code.claude.com/docs/en/hooks, "JSON
+# output"; no setting raises it). 20_000 here meant every session got only a
+# 2K preview - date and log top, no index at all (WI-bugfix-3adda1).
+MAX_CONTEXT_CHARS = 9_800
 MAX_LOG_LINES = 30
 
 # WI-bugfix-1e55f0 (knowledge-plane audit 2026-09-07, F6): the old code injected
@@ -105,21 +114,29 @@ def compact_index(index_text: str, budget: int) -> str:
     return "\n".join(out)
 
 
-def build_context() -> str:
-    """Assemble the context to inject into the conversation.
+def build_context(part: str) -> str:
+    """Assemble one part of the context to inject into the conversation.
 
-    Priority order (WI-bugfix-1e55f0): today's date and the recent daily log
-    are ALWAYS present; the index gets whatever budget remains and is compacted
-    explicitly rather than tail-truncated silently.
+    "log": today's date + the recent daily log; if the log alone overruns the
+    budget its OLDEST lines are cut, since the newest carry the most value.
+    "index": the knowledge index, compacted explicitly to the budget rather than
+    tail-truncated silently (WI-bugfix-1e55f0). Each part is its own hook so
+    each gets the full cap (WI-bugfix-3adda1).
     """
-    today = datetime.now(timezone.utc).astimezone()
-    today_part = f"## Today\n{today.strftime('%A, %B %d, %Y')}"
+    if part == "log":
+        today = datetime.now(timezone.utc).astimezone()
+        today_part = f"## Today\n{today.strftime('%A, %B %d, %Y')}"
+        head = "\n\n---\n\n## Recent Daily Log\n\n"
+        recent_log = get_recent_log()
+        room = MAX_CONTEXT_CHARS - len(today_part) - len(head)
+        if len(recent_log) > room:
+            cut_note = "...(earlier lines cut)\n"
+            tail = recent_log[-(room - len(cut_note)):]
+            # Drop the partial first line so the cut lands on a line boundary.
+            recent_log = cut_note + (tail.split("\n", 1)[1] if "\n" in tail else tail)
+        return today_part + head + recent_log
 
-    recent_log = get_recent_log()
-    log_part = f"## Recent Daily Log\n\n{recent_log}"
-
-    sep = "\n\n---\n\n"
-    index_budget = MAX_CONTEXT_CHARS - len(today_part) - len(log_part) - 3 * len(sep) - 40
+    index_budget = MAX_CONTEXT_CHARS - 40
 
     if INDEX_FILE.exists():
         index_content = INDEX_FILE.read_text(encoding="utf-8")
@@ -129,17 +146,23 @@ def build_context() -> str:
     else:
         index_part = "## Knowledge Base Index\n\n(empty - no articles compiled yet)"
 
-    context = sep.join([today_part, log_part, index_part])
+    # Hard backstop only — compact_index should keep us under on its own. The
+    # marker is counted INSIDE the budget, or the backstop itself breaks the cap.
+    if len(index_part) > MAX_CONTEXT_CHARS:
+        marker = "\n\n...(truncated)"
+        index_part = index_part[: MAX_CONTEXT_CHARS - len(marker)] + marker
 
-    # Hard backstop only — compact_index should keep us under on its own.
-    if len(context) > MAX_CONTEXT_CHARS:
-        context = context[:MAX_CONTEXT_CHARS] + "\n\n...(truncated)"
-
-    return context
+    return index_part
 
 
 def main():
-    context = build_context()
+    # Fail loudly: a silent default would hide a settings typo as a missing part.
+    args = sys.argv[1:]
+    part = args[args.index("--part") + 1] if args[-1:] != ["--part"] and "--part" in args else None
+    if part not in ("log", "index"):
+        print("session-start.py: needs --part log or --part index (WI-bugfix-3adda1)", file=sys.stderr)
+        sys.exit(1)
+    context = build_context(part)
 
     output = {
         "hookSpecificOutput": {
