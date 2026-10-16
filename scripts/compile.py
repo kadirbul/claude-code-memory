@@ -459,8 +459,93 @@ def report_deaths() -> None:
     print(f"[run pid={os.getpid()} started {stamp()}]")
 
 
+def hold_system_awake() -> bool:
+    """Ask Windows to keep this run alive until it exits; a no-op elsewhere.
+
+    WHY (WI-bugfix-e78c0f, owner option A 2026-10-16): on 2026-10-15 the PC sat in
+    Modern Standby from 19:24, so the 22:00 run started in a seconds-long maintenance
+    wake at 22:42:51 and was gone 20 s later - [exit=1], no line, no Claude call. The
+    owner wants the job done FROM standby without changing the schedule, so once
+    Windows lets it start it must be allowed to finish.
+
+    What does the work is SystemRequired: "the system continues to run instead of
+    entering sleep after a period of user inactivity" (MS Learn, PowerSetRequest). It
+    is system-wide, so it also covers the claude CLI child the SDK spawns.
+    ExecutionRequired is taken too, but its "process lifetime management" is the
+    packaged-app lifecycle, so for this plain Win32 process it is most likely a no-op.
+    This is an EXPERIMENT, not a proven fix: the 10-15 python returned exit 1 - it was
+    ended, not suspended - and nothing here targets whatever ended it; it only keeps
+    the machine out of the standby it died in. Not covered: the seconds before main()
+    (cmd + uv start-up). Documented limits: the requests end on lid close / power
+    button / Start->Sleep, and on DC power 5 minutes after the sleep timeout. The
+    reason string shows in `powercfg /requests` (needs an admin shell).
+
+    Process exit releases the request anyway; atexit clears it first, as the docs ask.
+    Never fatal: any failure is logged and the compile carries on as before.
+    """
+    if sys.platform != "win32":
+        return False  # cron/systemd/cloud hosts have no Modern Standby to fight
+    try:
+        return _take_power_requests()
+    except Exception as e:  # ctypes/loader errors must not cost the night's compile
+        print(f"  [keep-awake failed: {type(e).__name__}: {e}]")
+        return False
+
+
+def _take_power_requests() -> bool:
+    """The Windows half of hold_system_awake(); raises on a ctypes/loader error."""
+    import atexit
+    import ctypes
+    from ctypes import wintypes
+
+    class _Detailed(ctypes.Structure):
+        _fields_ = [("LocalizedReasonModule", wintypes.HMODULE),
+                    ("LocalizedReasonId", wintypes.ULONG),
+                    ("ReasonStringCount", wintypes.ULONG),
+                    ("ReasonStrings", ctypes.POINTER(wintypes.LPWSTR))]
+
+    class _Reason(ctypes.Union):
+        _fields_ = [("Detailed", _Detailed), ("SimpleReasonString", wintypes.LPWSTR)]
+
+    class REASON_CONTEXT(ctypes.Structure):
+        _fields_ = [("Version", wintypes.ULONG), ("Flags", wintypes.DWORD), ("Reason", _Reason)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.PowerCreateRequest.restype = wintypes.HANDLE
+    k32.PowerCreateRequest.argtypes = [ctypes.POINTER(REASON_CONTEXT)]
+    k32.PowerSetRequest.argtypes = k32.PowerClearRequest.argtypes = [wintypes.HANDLE, ctypes.c_int]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    SYSTEM_REQUIRED, EXECUTION_REQUIRED = 1, 3  # POWER_REQUEST_TYPE
+
+    ctx = REASON_CONTEXT(Version=0, Flags=0x1)  # POWER_REQUEST_CONTEXT_SIMPLE_STRING
+    ctx.Reason.SimpleReasonString = "Brain OS memory compile"
+    handle = k32.PowerCreateRequest(ctypes.byref(ctx))
+    if not handle or handle == wintypes.HANDLE(-1).value:
+        print(f"  [keep-awake refused: PowerCreateRequest error {ctypes.get_last_error()}]")
+        return False
+    held, errors = [], []
+    for t in (SYSTEM_REQUIRED, EXECUTION_REQUIRED):
+        if k32.PowerSetRequest(handle, t):
+            held.append(t)
+        else:
+            errors.append(f"type {t}: error {ctypes.get_last_error()}")  # read at the failing call
+
+    def release():
+        for t in held:
+            k32.PowerClearRequest(handle, t)
+        k32.CloseHandle(handle)
+
+    atexit.register(release)
+    if len(held) < 2:
+        print(f"  [keep-awake partial: {len(held)} of 2 requests, {'; '.join(errors)}]")
+    else:
+        print("  [keep-awake held: system + execution required until exit]")
+    return len(held) == 2
+
+
 def main():
     report_deaths()
+    hold_system_awake()  # first thing: the 10-15 run was killed 15 s after it started
     parser = argparse.ArgumentParser(description="Compile daily logs into knowledge articles")
     parser.add_argument("--all", action="store_true", help="Force recompile all logs")
     parser.add_argument("--file", type=str, help="Compile a specific daily log file")
