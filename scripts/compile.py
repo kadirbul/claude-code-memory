@@ -266,10 +266,11 @@ Read the daily log above and compile it into wiki articles following the schema 
     return prompt, len(related), len(all_paths)
 
 
-async def compile_daily_log(log_path: Path, state: dict, force: bool = False) -> float:
+async def compile_daily_log(log_path: Path, state: dict, force: bool = False) -> tuple[float, bool]:
     """Compile a single daily log into knowledge articles.
 
-    Returns the API cost of the compilation.
+    Returns the API cost and whether the log was compiled. False leaves it pending,
+    and main() counts it, so a run where every call is refused cannot report success.
     """
     from claude_agent_sdk import (
         AssistantMessage,
@@ -389,7 +390,7 @@ async def compile_daily_log(log_path: Path, state: dict, force: bool = False) ->
         print(f"  Error: {e}")
         state["total_cost"] = state.get("total_cost", 0.0) + cost
         save_state(state)
-        return cost
+        return cost, False
 
     # The capacity was consumed either way, so always bank it - an incomplete run that
     # reported a cost must still show up in the ledger (WI-bugfix-1fac6f).
@@ -401,14 +402,14 @@ async def compile_daily_log(log_path: Path, state: dict, force: bool = False) ->
         # here would tell select_log_content() the whole file was handled and the
         # unprocessed part would be skipped permanently.
         save_state(state)
-        return cost
+        return cost, False
 
     # Update state
     rel_path = log_path.name
     state.setdefault("ingested", {})[rel_path] = state_entry(raw_bytes, cost)
     save_state(state)
 
-    return cost
+    return cost, True
 
 
 def report_duplicates() -> None:
@@ -593,16 +594,25 @@ def main():
 
     # Compile each file sequentially
     total_cost = 0.0
+    failed = 0
     for i, log_path in enumerate(to_compile, 1):
         print(f"\n[{i}/{len(to_compile)}] {stamp()} Compiling {log_path.name}...")
-        cost = asyncio.run(
+        cost, ok = asyncio.run(
             compile_daily_log(log_path, state, force=bool(args.all or args.file))
         )
         total_cost += cost
+        failed += not ok
         print(f"  Done. ({stamp()})")
 
     articles = list_wiki_articles()
-    print(f"\nCompilation complete. Total cost: ${total_cost:.2f}")
+    # WHY: from 2026-11-07 every call was refused (oauth_org_not_allowed), yet each run
+    # said "Compilation complete" and exited 0, so four days compiled nothing unseen.
+    if failed:
+        print(f"\nCompilation FINISHED WITH FAILURES: {failed} of {len(to_compile)} log(s) FAILED"
+              f" and stay pending. Total cost: ${total_cost:.2f}")
+    else:
+        print(f"\nCompilation complete: {len(to_compile)} of {len(to_compile)} log(s) compiled."
+              f" Total cost: ${total_cost:.2f}")
     print(f"Knowledge base: {len(articles)} articles")
 
     # Duplication is otherwise invisible: nobody notices a synonym pile until someone
@@ -610,6 +620,9 @@ def main():
     # nightly log carries, so a regression shows up as a rising number, and a fix
     # has something to be measured against (WI-bugfix-3cdd9f).
     report_duplicates()
+    # 2, not 1: exit 1 is how a death shows in the log ([exit=1] with no summary).
+    if failed:
+        sys.exit(2)
 
 
 if __name__ == "__main__":
