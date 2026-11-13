@@ -14,6 +14,7 @@ scripts/flush.lock
 scripts/pkb_freshness.json
 scripts/scheduled_flush.log
 scripts/scheduled_compile.log
+scripts/scheduled_experience_push.log
 scripts/backfill-*.md
 scripts/preserved-retries.json
 scripts/preserved-failed/

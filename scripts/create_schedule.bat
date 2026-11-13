@@ -2,7 +2,7 @@
 REM ==========================================================================
 REM BrainOS PKB — Scheduled task installer
 REM
-REM Registers TWO Windows Task Scheduler tasks:
+REM Registers THREE Windows Task Scheduler tasks:
 REM   - BrainOS-MemoryFlush    at 20:00 daily   — forces a flush of the
 REM                                               in-flight session so today's
 REM                                               daily note exists even during
@@ -10,8 +10,15 @@ REM                                               multi-day sessions.
 REM   - BrainOS-MemoryCompile  at 22:00 daily   — compiles any new daily logs
 REM                                               into Obsidian knowledge
 REM                                               articles.
+REM   - BrainOS-ExperiencePush at 01:30 daily   — loads the compiled articles,
+REM                                               lessons, Z-Reports and memory
+REM                                               facts into KRS (WI-cr-2cdd9f).
+REM                                               Its own task, because the
+REM                                               compile's 2-hour limit (K476)
+REM                                               ends that whole file (K475).
 REM
-REM Both tasks run via wrapper .bat files (run_flush.bat / run_compile.bat)
+REM All three tasks run via wrapper .bat files (run_flush.bat / run_compile.bat /
+REM run_experience_push.bat)
 REM which set PATH, cd into the project dir, and log every run. This fixes
 REM the scheduled crash (-1073741502 / DLL init failure) caused by Task
 REM Scheduler not inheriting the user's interactive environment.
@@ -28,17 +35,23 @@ if %ERRORLEVEL% NEQ 0 goto :fail
 schtasks /create /tn "BrainOS-MemoryCompile" /tr "\"%SCRIPT_DIR%run_compile.bat\"" /sc daily /st 22:00 /f
 if %ERRORLEVEL% NEQ 0 goto :fail
 
+schtasks /create /tn "BrainOS-ExperiencePush" /tr "\"%SCRIPT_DIR%run_experience_push.bat\"" /sc daily /st 01:30 /f
+if %ERRORLEVEL% NEQ 0 goto :fail
+
 echo.
 echo ============================================================
 echo  Tasks registered successfully.
 echo    BrainOS-MemoryFlush    at 20:00 daily
 echo    BrainOS-MemoryCompile  at 22:00 daily
+echo    BrainOS-ExperiencePush at 01:30 daily
 echo ============================================================
 echo.
 echo Current status:
 schtasks /query /tn "BrainOS-MemoryFlush" /v /fo list | findstr /C:"TaskName" /C:"Next Run Time" /C:"Status" /C:"Last Result"
 echo.
 schtasks /query /tn "BrainOS-MemoryCompile" /v /fo list | findstr /C:"TaskName" /C:"Next Run Time" /C:"Status" /C:"Last Result"
+echo.
+schtasks /query /tn "BrainOS-ExperiencePush" /v /fo list | findstr /C:"TaskName" /C:"Next Run Time" /C:"Status" /C:"Last Result"
 goto :eof
 
 :fail
