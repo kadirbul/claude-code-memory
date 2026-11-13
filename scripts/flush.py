@@ -260,7 +260,11 @@ def main():
         # WI-bugfix-6733b8: a usage limit lasts until its reset time. Record it so the
         # retry paths wait instead of burning the same error on every file.
         from utils import is_rate_limit_error, record_rate_limit
-        if is_rate_limit_error(response):
+        # Only the SDK/API error part counts: "API result <subtype>: <model text>" carries
+        # partial MODEL output, which may talk about rate limits and must not set a pause.
+        api_part = response.startswith("FLUSH_ERROR: API ") and not response.startswith(
+            "FLUSH_ERROR: API result ")
+        if api_part and is_rate_limit_error(response):
             until = record_rate_limit(response)
             logging.error("Usage limit: no model calls until %s",
                           datetime.fromtimestamp(until).strftime("%Y-%m-%d %H:%M"))
