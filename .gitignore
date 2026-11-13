@@ -18,6 +18,7 @@ scripts/scheduled_experience_push.log
 scripts/backfill-*.md
 scripts/preserved-retries.json
 scripts/preserved-failed/
+scripts/rate-limit-until.json
 
 # Generated content (built up per-user by hooks and scripts)
 daily/

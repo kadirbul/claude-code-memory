@@ -314,6 +314,12 @@ def invoke_flush(context_file: Path, session_id: str, target_date: str) -> bool:
     Shared with retry_preserved.py (WI-bugfix-1b9f04), which re-flushes captures that an
     earlier failed flush left on disk.
     """
+    # WI-bugfix-6733b8: inside a recorded usage-limit window the call would only fail again.
+    from utils import rate_limit_seconds_left
+    if rate_limit_seconds_left() > 0:
+        print(f"  WAIT {session_id[:8]} [{target_date}]: usage limit, not calling the model", flush=True)
+        return False
+
     # Each (session, date) chunk needs its own dedup-bypass. For a retried capture this is
     # not optional: flush.py DELETES its input when the session flushed in the last 30 min.
     clear_dedup_for(session_id)

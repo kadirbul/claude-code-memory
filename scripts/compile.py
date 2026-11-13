@@ -266,6 +266,39 @@ Read the daily log above and compile it into wiki articles following the schema 
     return prompt, len(related), len(all_paths)
 
 
+# WHY (WI-bugfix-3f7b01): on 2026-11-11 log 3 hung (child idle, no CPU, no socket) and the
+# run waited on it until it died, so 14 logs were never tried. Logs take 1-12 minutes
+# (scheduled_compile.log); 30 minutes is far above that and 4 slow logs still fit the
+# task's 2-hour limit (K476). On expiry the log stays pending and is retried next night.
+LOG_TIMEOUT_S = 30 * 60
+
+
+class LogTimeout(Exception):
+    """One log used up its wall-clock limit."""
+
+
+async def with_deadline(agen, seconds: float):
+    """Yield from an async generator; raise LogTimeout once `seconds` of wall clock pass.
+
+    Cancelling the pending __anext__ throws into the SDK generator, whose cleanup closes
+    the transport and stops the claude.exe child; aclose() runs the same cleanup.
+    """
+    end = time.monotonic() + seconds
+    try:
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                raise LogTimeout()
+            try:
+                yield await asyncio.wait_for(agen.__anext__(), timeout=left)
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError:
+                raise LogTimeout() from None
+    finally:
+        await agen.aclose()
+
+
 async def compile_daily_log(log_path: Path, state: dict, force: bool = False) -> tuple[float, bool]:
     """Compile a single daily log into knowledge articles.
 
@@ -314,7 +347,7 @@ async def compile_daily_log(log_path: Path, state: dict, force: bool = False) ->
     incomplete = False
 
     try:
-        async for message in query(
+        async for message in with_deadline(query(
             prompt=prompt,
             options=ClaudeAgentOptions(
                 cwd=str(ROOT_DIR),
@@ -355,7 +388,7 @@ async def compile_daily_log(log_path: Path, state: dict, force: bool = False) ->
                 # these lines survive that kill.
                 stderr=lambda line: print(f"  [cli] {line}"),
             ),
-        ):
+        ), LOG_TIMEOUT_S):
             if isinstance(message, AssistantMessage):
                 if message.error:
                     # The real reason for an opaque exit-1 arrives here (WI-bugfix-4d7e21
@@ -381,6 +414,12 @@ async def compile_daily_log(log_path: Path, state: dict, force: bool = False) ->
                     print(f"  Incomplete result ({message.subtype}) —"
                           " leaving this log pending so it is retried in full")
                     incomplete = True
+    except LogTimeout:
+        # Bank any cost already seen; no "ingested" record, so the log is retried.
+        print(f"  TIMEOUT {log_path.name} after {LOG_TIMEOUT_S // 60} min - leaving it pending")
+        state["total_cost"] = state.get("total_cost", 0.0) + cost
+        save_state(state)
+        return cost, False
     except Exception as e:
         # The ResultMessage often arrives BEFORE the failure, so `cost` is usually
         # already set: returning 0.0 here threw away a real, already-incurred figure

@@ -4,6 +4,8 @@ import hashlib
 import json
 import math
 import re
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from config import (
@@ -15,6 +17,7 @@ from config import (
     LOG_FILE,
     PROJECTS_DIR,
     QA_DIR,
+    SCRIPTS_DIR,
     STATE_FILE,
 )
 
@@ -304,3 +307,66 @@ def build_index_entry(rel_path: str, summary: str, sources: str, updated: str) -
     """Build a single index table row."""
     link = rel_path.replace(".md", "")
     return f"| [[{link}]] | {summary} | {sources} | {updated} |"
+
+
+# ── Usage-limit pause (WI-bugfix-6733b8) ──────────────────────────────
+# A usage-limit error says when it resets ("resets 2am (Europe/Istanbul)"). Retries used
+# to ignore it: 88 captures failed the same limit and were set aside. flush.py records the
+# reset here; backfill.invoke_flush and retry_preserved.py read it and do not call the
+# model before that time.
+RATE_LIMIT_FILE = SCRIPTS_DIR / "rate-limit-until.json"
+DEFAULT_LIMIT_PAUSE_S = 30 * 60  # no reset time in the message: back off 30 minutes
+
+_RESET_RE = re.compile(r"resets\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)", re.IGNORECASE)
+
+
+def is_rate_limit_error(text: str) -> bool:
+    t = text.lower()
+    return "rate_limit" in t or "hit your limit" in t or "out of extra usage" in t
+
+
+def parse_reset_epoch(text: str, now: float | None = None) -> float | None:
+    """Epoch of the next 'resets 8pm' / 'resets 2:30am' in `text`, or None.
+
+    The zone in brackets is used when the tz database has it, else local time.
+    """
+    m = _RESET_RE.search(text)
+    if not m:
+        return None
+    hour = int(m.group(1)) % 12 + (12 if m.group(3).lower() == "pm" else 0)
+    minute = int(m.group(2) or 0)
+    now = time.time() if now is None else now
+    tz = None
+    z = re.search(r"\(([A-Za-z_]+/[A-Za-z_]+)\)", text[m.end():m.end() + 60])
+    if z:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(z.group(1))
+        except Exception:
+            tz = None
+    local = datetime.fromtimestamp(now, tz) if tz else datetime.fromtimestamp(now).astimezone()
+    target = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= local:
+        target += timedelta(days=1)
+    return target.timestamp()
+
+
+def record_rate_limit(text: str, now: float | None = None) -> float:
+    """Remember when the limit lifts (parsed reset, else now + 30 min). Returns that epoch."""
+    now = time.time() if now is None else now
+    until = parse_reset_epoch(text, now) or now + DEFAULT_LIMIT_PAUSE_S
+    try:
+        RATE_LIMIT_FILE.write_text(json.dumps({"until": until}), encoding="utf-8")
+    except OSError:
+        pass
+    return until
+
+
+def rate_limit_seconds_left(now: float | None = None) -> float:
+    """Seconds until the recorded limit lifts; 0 when none is active."""
+    now = time.time() if now is None else now
+    try:
+        until = float(json.loads(RATE_LIMIT_FILE.read_text(encoding="utf-8"))["until"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0.0
+    return max(0.0, until - now)

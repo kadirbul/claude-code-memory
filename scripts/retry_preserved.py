@@ -31,6 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import backfill  # noqa: E402
+import utils  # noqa: E402
 
 SCRIPTS_DIR = backfill.SCRIPTS_DIR
 ATTEMPTS_FILE = SCRIPTS_DIR / "preserved-retries.json"
@@ -38,6 +39,9 @@ FAILED_DIR = backfill.PRESERVED_FAILED_DIR
 MAX_PER_RUN = 10
 MAX_ATTEMPTS = 3
 MIN_AGE_S = 3600
+# WI-bugfix-6733b8: a usage limit that lifts within this wait is slept out; a longer one ends
+# the run, and neither counts as a failed attempt (the file did not fail, the limit did).
+MAX_LIMIT_WAIT_S = 1800
 
 # backfill-<sid>-<YYYY-MM-DD>-<YYYYMMDD-HHMMSS>.md  (backfill.py)
 # session-flush-<sid>-<YYYYMMDD-HHMMSS>.md          (session-end.py)
@@ -93,6 +97,14 @@ def main() -> int:
         if now - mtime < MIN_AGE_S:
             continue
         session_id, target_date = parse_name(capture.name)  # type: ignore[misc]
+        left = utils.rate_limit_seconds_left()
+        if left > MAX_LIMIT_WAIT_S:
+            print(f"  LIMIT usage limit for another {left / 60:.0f} min: stopping, no attempt counted",
+                  flush=True)
+            break
+        if left > 0:
+            print(f"  WAIT usage limit lifts in {left / 60:.0f} min", flush=True)
+            time.sleep(left + 5)
         tried += 1
         print(f"  RETRY {capture.name}", flush=True)
         if backfill.invoke_flush(capture, session_id, target_date):
@@ -100,6 +112,8 @@ def main() -> int:
             attempts.pop(capture.name, None)
             continue
         failed += 1
+        if utils.rate_limit_seconds_left() > 0:
+            break  # the limit failed it, not the file: do not count an attempt
         attempts[capture.name] = attempts.get(capture.name, 0) + 1
         if attempts[capture.name] >= MAX_ATTEMPTS and capture.exists():
             FAILED_DIR.mkdir(exist_ok=True)

@@ -257,6 +257,13 @@ def main():
         # retry_preserved.py from the nightly run_flush.bat (WI-bugfix-1b9f04).
         # Exits NON-ZERO so backfill.py and run_flush.bat cannot report a false green.
         logging.error("Result: %s", response)
+        # WI-bugfix-6733b8: a usage limit lasts until its reset time. Record it so the
+        # retry paths wait instead of burning the same error on every file.
+        from utils import is_rate_limit_error, record_rate_limit
+        if is_rate_limit_error(response):
+            until = record_rate_limit(response)
+            logging.error("Usage limit: no model calls until %s",
+                          datetime.fromtimestamp(until).strftime("%Y-%m-%d %H:%M"))
         logging.error("PRESERVED, not recorded and nothing appended: %s", context_file)
         return 1
     if response.strip() == "FLUSH_OK":
