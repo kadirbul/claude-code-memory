@@ -32,3 +32,19 @@ def now_iso() -> str:
 def today_iso() -> str:
     """Current date in ISO 8601 format."""
     return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
+
+
+def cli_model(task: str, default: str = "sonnet") -> str:
+    """The model for one background Claude call (K789): the Brain OS model settings page's
+    choice for `task`, else `default`. Works without Brain OS: if dev/shared is not there
+    (BRAINOS_DEV_ROOT, else ../dev beside this repo), the default is used."""
+    import os
+    import sys
+    dev_root = Path(os.getenv("BRAINOS_DEV_ROOT") or ROOT_DIR.parent / "dev")
+    try:
+        if str(dev_root) not in sys.path:
+            sys.path.append(str(dev_root))
+        from shared.config.llm_config import get_cli_model
+        return get_cli_model(task, default)
+    except Exception:
+        return default

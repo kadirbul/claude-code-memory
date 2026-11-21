@@ -15,7 +15,7 @@ import argparse
 import asyncio
 from pathlib import Path
 
-from config import KNOWLEDGE_DIR, REPORTS_DIR, now_iso, today_iso
+from config import KNOWLEDGE_DIR, REPORTS_DIR, cli_model, now_iso, today_iso
 from utils import (
     count_inbound_links,
     extract_wikilinks,
@@ -185,6 +185,7 @@ Do NOT output anything else - no preamble, no explanation, just the formatted li
             prompt=prompt,
             options=ClaudeAgentOptions(
                 cwd=str(ROOT_DIR),
+                model=cli_model("memory_lint"),
                 allowed_tools=[],
                 max_turns=2,
             ),
