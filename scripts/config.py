@@ -46,5 +46,7 @@ def cli_model(task: str, default: str = "sonnet") -> str:
             sys.path.append(str(dev_root))
         from shared.config.llm_config import get_cli_model
         return get_cli_model(task, default)
-    except Exception:
+    except Exception as exc:  # the fallback stays; the reason is logged once per call
+        import logging
+        logging.getLogger(__name__).warning("cli_model(%s): model settings unreadable (%s); using %s", task, exc, default)
         return default
